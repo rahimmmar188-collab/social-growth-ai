@@ -1,0 +1,16 @@
+{
+  "framework": "nextjs",
+  "buildCommand": "npm run build",
+  "devCommand": "npm run dev",
+  "installCommand": "npm install",
+  "functions": {
+    "src/app/api/agents/caption/route.ts": { "maxDuration": 60 },
+    "src/app/api/agents/create/route.ts": { "maxDuration": 60 },
+    "src/app/api/agents/dna/route.ts": { "maxDuration": 60 },
+    "src/app/api/agents/gap/route.ts": { "maxDuration": 60 },
+    "src/app/api/agents/strategy/route.ts": { "maxDuration": 60 },
+    "src/app/api/agents/trend/route.ts": { "maxDuration": 60 },
+    "src/app/api/agents/url/route.ts": { "maxDuration": 60 },
+    "src/app/api/competitors/posts/route.ts": { "maxDuration": 60 }
+  }
+}
