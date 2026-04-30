@@ -1,12 +1,13 @@
 import { createClient } from "@supabase/supabase-js";
 
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
-const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL ?? "";
+const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? "";
 
-// Browser-side singleton
+// Browser-side singleton — only created when URL is available
 let _client: ReturnType<typeof createClient> | null = null;
 
 export function getSupabaseClient() {
+  if (!supabaseUrl || !supabaseAnonKey) return null;
   if (!_client) {
     _client = createClient(supabaseUrl, supabaseAnonKey, {
       auth: {
@@ -18,7 +19,13 @@ export function getSupabaseClient() {
   return _client;
 }
 
-export const supabase = typeof window !== "undefined" ? getSupabaseClient() : createClient(supabaseUrl, supabaseAnonKey);
+// Safe singleton — returns null during SSR static prerender if env not available
+export const supabase =
+  typeof window !== "undefined" && supabaseUrl
+    ? getSupabaseClient()
+    : supabaseUrl
+    ? createClient(supabaseUrl, supabaseAnonKey)
+    : null;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 export interface Competitor {

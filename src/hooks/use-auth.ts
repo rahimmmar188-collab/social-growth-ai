@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from "react";
 import type { User, Session } from "@supabase/supabase-js";
-import { supabase } from "@/lib/supabase";
+import { getSupabaseClient } from "@/lib/supabase";
 import { signInWithGoogle, signInWithMagicLink, signOut } from "@/lib/auth";
 
 interface AuthState {
@@ -20,6 +20,12 @@ export function useAuth(): AuthState {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    const supabase = getSupabaseClient();
+    if (!supabase) {
+      setLoading(false);
+      return;
+    }
+
     // Get initial session
     supabase.auth.getSession().then(({ data }) => {
       setSession(data.session);

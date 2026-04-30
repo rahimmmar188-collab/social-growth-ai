@@ -27,3 +27,5 @@ Thumbs.db
 
 # Supabase setup file (contains sensitive SQL)
 supabase-setup.sql
+
+.vercel
