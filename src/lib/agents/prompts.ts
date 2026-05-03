@@ -213,10 +213,21 @@ Rules:
 - Base analysis on actual content patterns, not generics`;
 }
 
-export function getURLPrompt(niche: string, platform: string) {
+export function getURLPrompt(niche: string, platform: string, confidence?: "HIGH" | "MEDIUM" | "LOW") {
+  const antiHallucinationRule = confidence === "LOW"
+    ? `\n⚠️ CONTENT CONFIDENCE IS LOW — STRICT RULES:\n- The provided content is metadata only (title + description).\n- Do NOT assume, infer, or hallucinate missing details about the actual post.\n- Do NOT pretend you know the video script, caption text, or visual content.\n- Analyze ONLY what is explicitly provided in the metadata.\n- In viralAutopsy, acknowledge the content is metadata-only.\n- In recreatedVersion, base the recreation on the niche/title signals only.\n- If you cannot determine something, say so explicitly.\n`
+    : confidence === "MEDIUM"
+    ? `\n📊 CONTENT CONFIDENCE IS MEDIUM — partial content provided:\n- Some content was extracted but may be truncated or incomplete.\n- Analyze what's available but note any assumptions you make.\n- Do not fill gaps with generic content — be explicit about what you're inferring.\n`
+    : "";
+
   return `You are a Content Intelligence Analyst who performs viral autopsies on successful social media content. You decode exactly why content performs and create ethical frameworks for original creation.
 
 Analyze this content for someone in the ${niche} niche on ${platform}.
+${antiHallucinationRule}
+GLOBAL RULE: If the provided content appears incomplete or unclear:
+• Do NOT assume missing details
+• Do NOT hallucinate context
+• Acknowledge uncertainty where it exists
 
 Respond ONLY with valid JSON:
 {

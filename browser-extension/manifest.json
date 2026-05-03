@@ -1,0 +1,46 @@
+{
+  "manifest_version": 3,
+  "name": "Social Growth AI — Smart Import",
+  "version": "1.0.0",
+  "description": "Extract real social media captions and send them directly into Social Growth AI for accurate AI analysis.",
+  "icons": {
+    "16":  "icons/icon16.png",
+    "48":  "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16":  "icons/icon16.png",
+      "48":  "icons/icon48.png",
+      "128": "icons/icon128.png"
+    },
+    "default_title": "Social Growth AI — Smart Import"
+  },
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://*/*",
+    "http://*/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.instagram.com/*",
+        "https://www.tiktok.com/*",
+        "https://www.linkedin.com/*",
+        "https://twitter.com/*",
+        "https://x.com/*",
+        "https://www.facebook.com/*"
+      ],
+      "js": ["contentScript.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "background": {
+    "service_worker": "background.js"
+  }
+}

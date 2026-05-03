@@ -1,6 +1,9 @@
 import { NextRequest } from "next/server";
+import { scoreConfidence } from "@/lib/content-pipeline";
 
 export const runtime = "nodejs";
+
+const RESTRICTED = ["instagram", "tiktok", "linkedin", "facebook"];
 
 function detectPlatform(url: string): string {
   if (url.includes("youtube.com") || url.includes("youtu.be")) return "youtube";
@@ -20,7 +23,8 @@ async function fetchOpenGraph(url: string) {
     const html = await res.text();
 
     const getMeta = (name: string) => {
-      const match = html.match(new RegExp(`<meta[^>]+(?:property|name)=["']${name}["'][^>]+content=["']([^"']+)["']`, "i")) ||
+      const match =
+        html.match(new RegExp(`<meta[^>]+(?:property|name)=["']${name}["'][^>]+content=["']([^"']+)["']`, "i")) ||
         html.match(new RegExp(`<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["']${name}["']`, "i"));
       return match ? match[1] : "";
     };
@@ -70,6 +74,7 @@ export async function POST(req: NextRequest) {
     if (!url) return new Response("URL required", { status: 400 });
 
     const platform = detectPlatform(url);
+    const isRestricted = RESTRICTED.includes(platform);
     let metadata: Record<string, unknown> = { url, platform };
 
     if (platform === "youtube") {
@@ -85,7 +90,10 @@ export async function POST(req: NextRequest) {
       metadata = { ...metadata, ...og };
     }
 
-    return new Response(JSON.stringify(metadata), {
+    // Compute confidence — restricted platforms are always LOW regardless of what we extracted
+    const confidence = isRestricted ? "LOW" : scoreConfidence(metadata);
+
+    return new Response(JSON.stringify({ ...metadata, confidence }), {
       headers: { "Content-Type": "application/json" },
     });
   } catch (err) {

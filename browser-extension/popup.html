@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Social Growth AI</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="popup">
+
+    <!-- Header -->
+    <div class="header">
+      <div class="logo">
+        <svg width="22" height="22" viewBox="0 0 22 22" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <circle cx="11" cy="11" r="11" fill="url(#grad)"/>
+          <path d="M12.5 4L7 12h5l-1.5 6L17 10h-5L12.5 4z" fill="white"/>
+          <defs>
+            <linearGradient id="grad" x1="0" y1="0" x2="22" y2="22" gradientUnits="userSpaceOnUse">
+              <stop stop-color="#7c6ff7"/>
+              <stop offset="1" stop-color="#5b5bd6"/>
+            </linearGradient>
+          </defs>
+        </svg>
+      </div>
+      <div class="header-text">
+        <h1>Social Growth AI</h1>
+        <p>Smart Content Import</p>
+      </div>
+    </div>
+
+    <!-- Platform Detected -->
+    <div class="platform-row" id="platformRow">
+      <div class="platform-dot" id="platformDot"></div>
+      <span id="platformLabel">Detecting page…</span>
+    </div>
+
+    <!-- Content Preview -->
+    <div class="preview-box" id="previewBox" style="display:none;">
+      <div class="preview-label">Content detected</div>
+      <div class="preview-text" id="previewText"></div>
+      <div class="preview-chars" id="previewChars"></div>
+    </div>
+
+    <!-- No Content Warning -->
+    <div class="warning-box" id="warningBox" style="display:none;">
+      <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+        <path d="M7 1L13 13H1L7 1z" stroke="#f59e0b" stroke-width="1.5" fill="none"/>
+        <path d="M7 6v3M7 10.5v.5" stroke="#f59e0b" stroke-width="1.5" stroke-linecap="round"/>
+      </svg>
+      <span id="warningText">No extractable content found on this page.</span>
+    </div>
+
+    <!-- Main Action Button -->
+    <button class="send-btn" id="sendBtn" disabled>
+      <span class="btn-icon" id="btnIcon">
+        <svg width="15" height="15" viewBox="0 0 15 15" fill="none">
+          <path d="M13 7.5L2 2l2.5 5.5L2 13l11-5.5z" fill="currentColor"/>
+        </svg>
+      </span>
+      <span id="btnText">Send to Social Growth AI</span>
+    </button>
+
+    <!-- Status Messages -->
+    <div class="status" id="statusIdle" style="display:none;">
+      <div class="status-success">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+          <circle cx="8" cy="8" r="7" stroke="#10b981" stroke-width="1.5"/>
+          <path d="M5 8l2 2 4-4" stroke="#10b981" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <div>
+          <strong>Content Sent! 🟢</strong>
+          <p>Opening Social Growth AI — your content will load automatically.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="status error-status" id="statusError" style="display:none;">
+      <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+        <circle cx="7" cy="7" r="6" stroke="#ef4444" stroke-width="1.5"/>
+        <path d="M5 5l4 4M9 5L5 9" stroke="#ef4444" stroke-width="1.5" stroke-linecap="round"/>
+      </svg>
+      <span id="errorText">Failed to send. Check your connection.</span>
+    </div>
+
+    <!-- Footer -->
+    <div class="footer">
+      <div class="app-url" id="appUrl">
+        <a href="#" id="openAppLink">Open Social Growth AI ↗</a>
+      </div>
+      <button class="settings-btn" id="settingsToggle" title="Settings">⚙</button>
+    </div>
+
+    <!-- Settings Panel -->
+    <div class="settings-panel" id="settingsPanel" style="display:none;">
+      <label class="settings-label">App URL</label>
+      <input class="settings-input" id="appUrlInput" type="url"
+        placeholder="https://social-growth-ai-nu.vercel.app" />
+      <button class="save-btn" id="saveSettings">Save</button>
+    </div>
+
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>

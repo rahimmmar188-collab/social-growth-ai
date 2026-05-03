@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useState, useCallback, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useAppStore } from "@/lib/store";
 import { useStreaming } from "@/hooks/use-streaming";
@@ -12,7 +12,8 @@ import SaveButton from "@/components/shared/save-button";
 import ErrorBanner from "@/components/shared/error-banner";
 import ExportButton from "@/components/shared/export-button";
 import RefinedBadge from "@/components/shared/refined-badge";
-import { BarChart3, Sparkles, Calendar } from "lucide-react";
+import ConfidenceBadge from "@/components/shared/confidence-badge";
+import { BarChart3, Sparkles, Calendar, Plug, CheckCircle2 } from "lucide-react";
 import { Platform } from "@/lib/store";
 
 const platforms: { value: Platform; label: string }[] = [
@@ -25,10 +26,69 @@ export default function AnalyzerPage() {
   const { userProfile, ui, incrementUsage } = useAppStore();
   const [caption, setCaption] = useState("");
   const [platform, setPlatform] = useState<Platform>(ui.activePlatform);
-  const { data, isStreaming, isRefined, error, startStreaming, reset } = useStreaming<StrategyResult>();
+  const [importingExt, setImportingExt] = useState(false);
+  const [extensionImported, setExtensionImported] = useState(false);
+  const [extensionSessionId, setExtensionSessionId] = useState<string | null>(null);
+  const didAutoImport = useRef(false);
+  const { data, isStreaming, isRefined, error, startStreaming, reset } =
+    useStreaming<StrategyResult>();
+
+  // ── Part 7: Auto-import extension content on page load ────────────────────────
+  useEffect(() => {
+    if (didAutoImport.current) return;
+    didAutoImport.current = true;
+    fetch("/api/extract?session=latest")
+      .then((r) => r.json())
+      .then((ext) => {
+        if (ext.content && ext.content.length > 10) {
+          setCaption(ext.content);
+          setExtensionImported(true);
+          setExtensionSessionId(ext.sessionId || null);
+          if (ext.platform && ext.platform !== "unknown") {
+            const pl = ext.platform.toLowerCase() as Platform;
+            if (["instagram", "linkedin", "facebook"].includes(pl)) setPlatform(pl);
+          }
+        }
+      })
+      .catch(() => { /* silent */ });
+  }, []);
+
+  // ── Part 9: Session cleanup after analysis completes ──────────────────────────
+  useEffect(() => {
+    if (data && !isStreaming && extensionSessionId) {
+      fetch(`/api/extract?session=${extensionSessionId}`, { method: "DELETE" })
+        .catch(() => {});
+      setExtensionSessionId(null);
+    }
+  }, [data, isStreaming, extensionSessionId]);
+
+  // ── Manual Extension import ─────────────────────────────────────────────────
+  const handleImportFromExtension = useCallback(async () => {
+    setImportingExt(true);
+    try {
+      const res = await fetch("/api/extract?session=latest");
+      const ext = await res.json();
+      if (ext.content) {
+        setCaption(ext.content);
+        setExtensionImported(true);
+        setExtensionSessionId(ext.sessionId || null);
+        if (ext.platform && ext.platform !== "unknown") {
+          const pl = ext.platform.toLowerCase() as Platform;
+          if (["instagram", "linkedin", "facebook"].includes(pl)) setPlatform(pl);
+        }
+      } else {
+        alert("No content found. Open the Social Growth AI extension on a social media post first.");
+      }
+    } catch {
+      alert("Could not connect to extension import. Try again.");
+    } finally {
+      setImportingExt(false);
+    }
+  }, []);
 
   const handleAnalyze = async () => {
     if (!caption.trim()) return;
+    setExtensionImported(false);
     incrementUsage();
     await startStreaming("/api/agents/strategy", {
       niche: userProfile.niche || "general",
@@ -37,15 +97,43 @@ export default function AnalyzerPage() {
     });
   };
 
-  const exportSections = data ? [
-    { heading: "Analyzed Content", body: caption },
-    { heading: "Viral Score", body: `${data.viralScore ?? "N/A"}/10` },
-    { heading: "Score Breakdown", body: Object.entries(data.scoreBreakdown || {}).map(([k, v]) => `${k}: ${v}/10`).join("\n") },
-    { heading: "Best Posting Windows", body: (data.bestPostingWindows || []).map((w) => `${w.day} @ ${w.time}`).join("\n") },
-    { heading: "Improvement Actions", body: (data.improvementActions || []).map((a, i) => `${i + 1}. ${a}`).join("\n") },
-    { heading: "Engagement Strategies", body: (data.engagementBait || []).join("\n") },
-    { heading: "30-Day Calendar", body: (data.calendarSuggestion || []).map((w) => `Week ${w.week} — ${w.theme}:\n${(w.posts || []).join("\n")}`).join("\n\n") },
-  ] : [];
+  const exportSections = data
+    ? [
+        { heading: "Analyzed Content", body: caption },
+        { heading: "Viral Score", body: `${data.viralScore ?? "N/A"}/10` },
+        {
+          heading: "Score Breakdown",
+          body: Object.entries(data.scoreBreakdown || {})
+            .map(([k, v]) => `${k}: ${v}/10`)
+            .join("\n"),
+        },
+        {
+          heading: "Best Posting Windows",
+          body: (data.bestPostingWindows || [])
+            .map((w) => `${w.day} @ ${w.time}`)
+            .join("\n"),
+        },
+        {
+          heading: "Improvement Actions",
+          body: (data.improvementActions || [])
+            .map((a, i) => `${i + 1}. ${a}`)
+            .join("\n"),
+        },
+        {
+          heading: "Engagement Strategies",
+          body: (data.engagementBait || []).join("\n"),
+        },
+        {
+          heading: "30-Day Calendar",
+          body: (data.calendarSuggestion || [])
+            .map(
+              (w) =>
+                `Week ${w.week} — ${w.theme}:\n${(w.posts || []).join("\n")}`
+            )
+            .join("\n\n"),
+        },
+      ]
+    : [];
 
   return (
     <div className="space-y-6">
@@ -57,29 +145,100 @@ export default function AnalyzerPage() {
           Analyze Draft
         </h1>
         <p className="text-muted-foreground text-sm mt-1">
-          Paste your draft content and get a viral score, posting windows, and a 30-day calendar
+          Paste your draft content and get a viral score, posting windows, and a
+          30-day calendar
         </p>
       </div>
 
       <GlassCard hover={false}>
         <div className="space-y-4">
-          <textarea
-            value={caption}
-            onChange={(e) => setCaption(e.target.value)}
-            placeholder="Paste your caption, hook, or post idea here…"
-            className="w-full glass-input px-4 py-3 text-sm text-foreground placeholder:text-muted-foreground/50 outline-none resize-none min-h-[100px]"
-            disabled={isStreaming}
-          />
+          {/* ── Extension import success banner ── */}
+          <AnimatePresence>
+            {extensionImported && (
+              <motion.div
+                initial={{ opacity: 0, y: -6 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -6 }}
+                className="flex items-center gap-2 px-3.5 py-2.5 rounded-xl bg-emerald-500/10 border border-emerald-500/20"
+              >
+                <CheckCircle2 className="w-4 h-4 text-emerald-400 flex-shrink-0" />
+                <span className="text-sm text-emerald-400 font-medium">
+                  Imported real content from browser
+                </span>
+                <ConfidenceBadge confidence="HIGH" />
+              </motion.div>
+            )}
+          </AnimatePresence>
+
+          {/* ── Textarea ── */}
+          <div className="relative">
+            <textarea
+              value={caption}
+              onChange={(e) => {
+                setCaption(e.target.value);
+                if (extensionImported) setExtensionImported(false);
+              }}
+              placeholder="Paste your caption, hook, or post idea here…"
+              className="w-full glass-input px-4 py-3 text-sm text-foreground placeholder:text-muted-foreground/50 outline-none resize-none min-h-[120px]"
+              disabled={isStreaming}
+            />
+            {caption && (
+              <span className="absolute bottom-2 right-3 text-xs text-muted-foreground/50">
+                {caption.length} chars
+              </span>
+            )}
+          </div>
+
+          {/* ── Controls row ── */}
           <div className="flex items-center justify-between gap-3 flex-wrap">
-            <PillTabs options={platforms} value={platform} onChange={setPlatform} />
+            <div className="flex items-center gap-2 flex-wrap">
+              <PillTabs
+                options={platforms}
+                value={platform}
+                onChange={setPlatform}
+              />
+              {/* Import from Extension button */}
+              <button
+                onClick={handleImportFromExtension}
+                disabled={importingExt || isStreaming}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs font-medium transition-all disabled:opacity-50 ${
+                  extensionImported
+                    ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
+                    : "bg-violet/10 text-violet border-violet/20 hover:bg-violet/20"
+                }`}
+              >
+                {importingExt ? (
+                  <>
+                    <Sparkles className="w-3 h-3 animate-spin" /> Checking…
+                  </>
+                ) : extensionImported ? (
+                  <>
+                    <CheckCircle2 className="w-3 h-3" /> Imported
+                  </>
+                ) : (
+                  <>
+                    <Plug className="w-3 h-3" /> Import from Extension
+                  </>
+                )}
+              </button>
+            </div>
+
             <button
               onClick={handleAnalyze}
               disabled={!caption.trim() || isStreaming}
               className="flex items-center gap-2 px-5 py-2.5 rounded-xl gradient-violet text-white text-sm font-medium disabled:opacity-40 hover:opacity-90 transition-opacity"
             >
-              {isStreaming
-                ? <><Sparkles className="w-4 h-4 animate-spin" />Analyzing…</>
-                : <><BarChart3 className="w-4 h-4" />Analyze</>}
+              {isStreaming ? (
+                <>
+                  <Sparkles className="w-4 h-4 animate-spin" />
+                  Analyzing…
+                </>
+              ) : (
+                <>
+                  <BarChart3 className="w-4 h-4" />
+                  Analyze
+                </>
+              )}
             </button>
           </div>
         </div>
@@ -87,7 +246,9 @@ export default function AnalyzerPage() {
 
       {isStreaming && !data && (
         <div className="space-y-3">
-          {[...Array(3)].map((_, i) => <SkeletonCard key={i} lines={4 + i} />)}
+          {[...Array(3)].map((_, i) => (
+            <SkeletonCard key={i} lines={4 + i} />
+          ))}
         </div>
       )}
 
@@ -95,34 +256,76 @@ export default function AnalyzerPage() {
 
       <AnimatePresence>
         {data && (
-          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="space-y-4">
-
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            className="space-y-4"
+          >
             {/* Viral Score */}
             <GlassCard hover={false} delay={0}>
               <div className="flex items-center justify-between mb-4">
                 <div className="flex items-center gap-2">
-                  <h3 className="font-heading font-semibold text-sm text-foreground">Viral Score</h3>
+                  <h3 className="font-heading font-semibold text-sm text-foreground">
+                    Viral Score
+                  </h3>
                   <RefinedBadge visible={isRefined} />
                 </div>
                 <div className="flex items-center gap-2">
-                  <SaveButton item={{ type: "analysis", content: { score: data.viralScore, breakdown: data.scoreBreakdown }, tags: ["analysis", platform], folder: "Analyses", title: `Analysis — ${caption.slice(0, 40)}` }} />
-                  <ExportButton variant="icon" filename="analyzer-report" title="Draft Analysis Report" sections={exportSections} />
+                  <SaveButton
+                    item={{
+                      type: "analysis",
+                      content: {
+                        score: data.viralScore,
+                        breakdown: data.scoreBreakdown,
+                      },
+                      tags: ["analysis", platform],
+                      folder: "Analyses",
+                      title: `Analysis — ${caption.slice(0, 40)}`,
+                    }}
+                  />
+                  <ExportButton
+                    variant="icon"
+                    filename="analyzer-report"
+                    title="Draft Analysis Report"
+                    sections={exportSections}
+                  />
                 </div>
               </div>
               <div className="flex items-center gap-6">
                 <div className="relative flex-shrink-0">
                   <svg className="w-24 h-24 -rotate-90" viewBox="0 0 80 80">
-                    <circle cx="40" cy="40" r="32" fill="none" stroke="rgba(255,255,255,0.06)" strokeWidth="8" />
+                    <circle
+                      cx="40"
+                      cy="40"
+                      r="32"
+                      fill="none"
+                      stroke="rgba(255,255,255,0.06)"
+                      strokeWidth="8"
+                    />
                     <motion.circle
-                      cx="40" cy="40" r="32" fill="none" stroke="#7c6ff7" strokeWidth="8"
-                      strokeLinecap="round" strokeDasharray={`${2 * Math.PI * 32}`}
+                      cx="40"
+                      cy="40"
+                      r="32"
+                      fill="none"
+                      stroke="#7c6ff7"
+                      strokeWidth="8"
+                      strokeLinecap="round"
+                      strokeDasharray={`${2 * Math.PI * 32}`}
                       initial={{ strokeDashoffset: 2 * Math.PI * 32 }}
-                      animate={{ strokeDashoffset: 2 * Math.PI * 32 * (1 - (data.viralScore || 0) / 10) }}
+                      animate={{
+                        strokeDashoffset:
+                          2 *
+                          Math.PI *
+                          32 *
+                          (1 - (data.viralScore || 0) / 10),
+                      }}
                       transition={{ duration: 1.5, ease: "easeOut" }}
                     />
                   </svg>
                   <div className="absolute inset-0 flex flex-col items-center justify-center">
-                    <span className="font-heading font-bold text-3xl text-foreground">{data.viralScore}</span>
+                    <span className="font-heading font-bold text-3xl text-foreground">
+                      {data.viralScore}
+                    </span>
                     <span className="text-xs text-muted-foreground">/10</span>
                   </div>
                 </div>
@@ -130,8 +333,12 @@ export default function AnalyzerPage() {
                   {Object.entries(data.scoreBreakdown || {}).map(([k, v]) => (
                     <div key={k} className="space-y-0.5">
                       <div className="flex justify-between text-xs">
-                        <span className="text-muted-foreground capitalize">{k}</span>
-                        <span className="text-foreground font-medium">{v as number}/10</span>
+                        <span className="text-muted-foreground capitalize">
+                          {k}
+                        </span>
+                        <span className="text-foreground font-medium">
+                          {v as number}/10
+                        </span>
                       </div>
                       <div className="h-1.5 rounded-full bg-white/[0.06] overflow-hidden">
                         <motion.div
@@ -154,7 +361,10 @@ export default function AnalyzerPage() {
               </h3>
               <div className="grid grid-cols-3 gap-2">
                 {data.bestPostingWindows?.map((w, i) => (
-                  <div key={i} className="p-3 rounded-xl bg-white/[0.03] border border-white/[0.06] text-center">
+                  <div
+                    key={i}
+                    className="p-3 rounded-xl bg-white/[0.03] border border-white/[0.06] text-center"
+                  >
                     <p className="text-sm font-medium text-foreground">{w.day}</p>
                     <p className="text-teal text-xs mt-0.5">{w.time}</p>
                   </div>
@@ -169,8 +379,13 @@ export default function AnalyzerPage() {
               </h3>
               <div className="space-y-2">
                 {data.improvementActions?.map((a, i) => (
-                  <div key={i} className="flex items-start gap-2 p-3 rounded-xl bg-violet/[0.04] border border-violet/[0.08]">
-                    <span className="text-violet font-bold flex-shrink-0">{i + 1}.</span>
+                  <div
+                    key={i}
+                    className="flex items-start gap-2 p-3 rounded-xl bg-violet/[0.04] border border-violet/[0.08]"
+                  >
+                    <span className="text-violet font-bold flex-shrink-0">
+                      {i + 1}.
+                    </span>
                     <p className="text-sm text-foreground">{a}</p>
                   </div>
                 ))}
@@ -182,10 +397,23 @@ export default function AnalyzerPage() {
               <GlassCard hover={false} delay={0.14}>
                 <div className="flex items-center justify-between mb-4">
                   <h3 className="font-heading font-semibold text-sm flex items-center gap-2">
-                    <Calendar className="w-4 h-4 text-teal" /> 30-Day Content Calendar
+                    <Calendar className="w-4 h-4 text-teal" /> 30-Day Content
+                    Calendar
                   </h3>
                   <div className="flex items-center gap-2">
-                    <SaveButton item={{ type: "report", content: data.calendarSuggestion as unknown as Record<string, unknown>, tags: ["calendar"], folder: "Strategies", title: "30-Day Content Calendar" }} />
+                    <SaveButton
+                      item={{
+                        type: "report",
+                        content:
+                          data.calendarSuggestion as unknown as Record<
+                            string,
+                            unknown
+                          >,
+                        tags: ["calendar"],
+                        folder: "Strategies",
+                        title: "30-Day Content Calendar",
+                      }}
+                    />
                     <ExportButton
                       variant="pill"
                       label="Export Calendar"
@@ -203,14 +431,23 @@ export default function AnalyzerPage() {
                 </div>
                 <div className="space-y-3">
                   {data.calendarSuggestion?.map((week, i) => (
-                    <div key={i} className="p-3 rounded-xl bg-white/[0.03] border border-white/[0.06]">
+                    <div
+                      key={i}
+                      className="p-3 rounded-xl bg-white/[0.03] border border-white/[0.06]"
+                    >
                       <div className="flex items-center gap-2 mb-2">
-                        <span className="text-xs font-semibold text-violet">Week {week.week}</span>
-                        <span className="text-xs text-muted-foreground">Theme: {week.theme}</span>
+                        <span className="text-xs font-semibold text-violet">
+                          Week {week.week}
+                        </span>
+                        <span className="text-xs text-muted-foreground">
+                          Theme: {week.theme}
+                        </span>
                       </div>
                       <div className="space-y-1">
                         {week.posts?.map((post, j) => (
-                          <p key={j} className="text-xs text-muted-foreground">• {post}</p>
+                          <p key={j} className="text-xs text-muted-foreground">
+                            • {post}
+                          </p>
                         ))}
                       </div>
                     </div>
@@ -235,7 +472,6 @@ export default function AnalyzerPage() {
                 </div>
               </GlassCard>
             )}
-
           </motion.div>
         )}
       </AnimatePresence>
