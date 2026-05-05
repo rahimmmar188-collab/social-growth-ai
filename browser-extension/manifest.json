@@ -21,7 +21,8 @@
     "activeTab",
     "scripting",
     "storage",
-    "system.display"
+    "system.display",
+    "notifications"
   ],
   "host_permissions": [
     "https://*/*",
