@@ -5,50 +5,71 @@ color 0B
 echo.
 echo  ==============================================
 echo   Social Growth AI - Smart Content Import
-echo   Auto-Installer
+echo   Extension Installer v2.0
 echo  ==============================================
 echo.
 
-:: Detect if running from inside a ZIP (Windows extracts to Temp)
+:: ── Detect if running from inside a ZIP ──────────────────────────────────────
 echo %~dp0 | findstr /i "Temp" >nul
 if %errorlevel% equ 0 (
+    color 0C
     echo.
-    echo  [ERROR] Please EXTRACT the ZIP file first!
-    echo  Right-click the ZIP and choose "Extract All".
-    echo  Then run install.bat from the extracted folder.
+    echo  [ERROR] You are running this from INSIDE the ZIP file!
+    echo.
+    echo  Please do this first:
+    echo   1. Close this window
+    echo   2. Right-click the ZIP file
+    echo   3. Choose "Extract All"
+    echo   4. Open the extracted folder
+    echo   5. Double-click install.bat again
     echo.
     pause
     exit /b 1
 )
 
-:: Check for Node.js
+:: ── Check for Node.js ─────────────────────────────────────────────────────────
 where node >nul 2>&1
 if %errorlevel% neq 0 (
-    echo  [ERROR] Node.js is required but not found.
-    echo  Download it from: https://nodejs.org
+    color 0E
+    echo  [WARN] Node.js not found - skipping icon generation.
+    echo  Icons may not display. Download Node from https://nodejs.org
     echo.
-    pause
-    exit /b 1
+    goto :skip_icons
 )
 
-:: Generate icons
-echo  [1/3] Generating icons...
+:: ── Generate icons ────────────────────────────────────────────────────────────
+echo  [1/3] Generating extension icons...
 node "%~dp0generate-icons.js"
 if %errorlevel% neq 0 (
-    echo  [WARN] Icon generation had an issue - continuing anyway.
+    echo  [WARN] Icon generation had issues - using defaults.
 )
 echo  [OK] Icons ready.
 echo.
 
-:: Run the PowerShell installer (no arguments - it uses $PSScriptRoot)
-echo  [2/3] Installing Chrome extension...
+:skip_icons
+
+:: ── Run PowerShell installer ──────────────────────────────────────────────────
+echo  [2/3] Installing extension into Chrome...
 echo.
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0install.ps1"
 
 echo.
-echo  [3/3] Done!
+echo  [3/3] COMPLETE!
 echo.
-echo  Chrome is now open with the extension loaded.
-echo  Click the puzzle-piece icon in Chrome and pin Social Growth AI.
+echo  ============================================================
+echo   Chrome has opened to the Extensions page.
+echo  ============================================================
+echo.
+echo   NEXT STEPS (takes 30 seconds):
+echo.
+echo   1. Look at Chrome - it should show the Extensions page
+echo   2. Find "Social Growth AI" in the list
+echo   3. Make sure its toggle is ON (blue/enabled)
+echo   4. Click the PUZZLE PIECE icon in Chrome's top-right corner
+echo   5. Click the PIN icon next to "Social Growth AI"
+echo   6. DONE - the icon now permanently shows in your toolbar!
+echo.
+echo   TIP: Always use the "Social Growth AI" shortcut on your
+echo   Desktop to keep the extension active when browsing.
 echo.
 pause

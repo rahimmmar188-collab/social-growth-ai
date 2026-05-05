@@ -1,9 +1,13 @@
-# Social Growth AI - Chrome Extension Installer
-# Installs into the user's DEFAULT Chrome profile so it works everywhere.
+# Social Growth AI - Chrome Extension Permanent Installer v3
+# Strategy:
+# 1. Copy extension to AppData (permanent safe location)
+# 2. Launch Chrome with --load-extension pointing to AppData path
+# 3. Open chrome://extensions page so user can see + pin the extension
+# 4. Create Desktop shortcut that ALWAYS uses --load-extension
+# (This is the only reliable developer-mode method without Chrome Web Store)
 
-$ErrorActionPreference = "Continue"
-$ExtPath = $PSScriptRoot
-$appUrl  = "https://social-growth-ai-nu.vercel.app/extension"
+$ErrorActionPreference = "SilentlyContinue"
+$SourcePath = $PSScriptRoot
 
 Write-Host ""
 Write-Host "  ============================================" -ForegroundColor Cyan
@@ -12,12 +16,11 @@ Write-Host "  ============================================" -ForegroundColor Cya
 Write-Host ""
 
 # ── Validate extension folder ─────────────────────────────────────────────────
-if (-not (Test-Path -LiteralPath "$ExtPath\manifest.json")) {
+if (-not (Test-Path -LiteralPath "$SourcePath\manifest.json")) {
     Write-Host "  [ERROR] manifest.json not found." -ForegroundColor Red
-    Write-Host "  Run install.bat from the extracted folder, not inside the ZIP." -ForegroundColor Yellow
+    Write-Host "  Extract the ZIP first, then run install.bat." -ForegroundColor Yellow
     exit 1
 }
-Write-Host "  Extension folder: $ExtPath" -ForegroundColor Gray
 
 # ── Find Chrome ───────────────────────────────────────────────────────────────
 $chromePaths = @(
@@ -33,64 +36,82 @@ foreach ($p in $chromePaths) {
 }
 if (-not $chrome) {
     try {
-        $r = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe" -EA SilentlyContinue)."(Default)"
+        $r = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe")."(Default)"
         if ($r -and (Test-Path -LiteralPath $r)) { $chrome = $r }
     } catch {}
 }
 if (-not $chrome) {
-    Write-Host "  [ERROR] Chrome not found. Install from https://www.google.com/chrome" -ForegroundColor Red
+    Write-Host "  [ERROR] Chrome not found. Install Google Chrome and try again." -ForegroundColor Red
     exit 1
 }
 Write-Host "  Chrome: $chrome" -ForegroundColor Green
 
-# ── Close all Chrome windows so --load-extension takes effect ─────────────────
+# ── Copy extension to a permanent location in AppData ─────────────────────────
+$InstallDir = "$env:LOCALAPPDATA\SocialGrowthAI\Extension"
+Write-Host "  Installing to: $InstallDir" -ForegroundColor Gray
+
+if (Test-Path -LiteralPath $InstallDir) {
+    Remove-Item -LiteralPath $InstallDir -Recurse -Force
+}
+New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+Copy-Item -Path "$SourcePath\*" -Destination $InstallDir -Recurse -Force
+Write-Host "  Files installed successfully." -ForegroundColor Green
+
+# ── Close Chrome so --load-extension takes effect ─────────────────────────────
 $running = Get-Process -Name "chrome" -ErrorAction SilentlyContinue
 if ($running) {
     Write-Host ""
-    Write-Host "  Closing Chrome to apply the extension..." -ForegroundColor Yellow
+    Write-Host "  Closing Chrome to apply changes..." -ForegroundColor Yellow
     Stop-Process -Name "chrome" -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 2
+    Start-Sleep -Seconds 3
     Write-Host "  Chrome closed." -ForegroundColor Gray
 }
 
-# ── Launch Chrome with extension into the DEFAULT profile ─────────────────────
-# NO --user-data-dir so the extension loads into the user's regular Chrome.
-Write-Host ""
-Write-Host "  Opening Chrome with extension installed..." -ForegroundColor Cyan
-
-$argString = "--load-extension=`"$ExtPath`" --no-first-run --no-default-browser-check `"$appUrl`""
-Start-Process -FilePath $chrome -ArgumentList $argString
-Start-Sleep -Seconds 3
-
-# ── Create Desktop shortcut (always opens Chrome with extension active) ────────
-Write-Host "  Creating desktop shortcut..." -ForegroundColor Cyan
-
+# ── Create Desktop shortcut (this is the permanent solution) ──────────────────
+# The shortcut always passes --load-extension so the extension is ALWAYS active
 $desktop  = [Environment]::GetFolderPath("Desktop")
-$lnkPath  = "$desktop\Social Growth AI (Extension).lnk"
+$lnkPath  = "$desktop\Social Growth AI.lnk"
 $wsh      = New-Object -ComObject WScript.Shell
 $shortcut = $wsh.CreateShortcut($lnkPath)
 $shortcut.TargetPath       = $chrome
-$shortcut.Arguments        = "--load-extension=`"$ExtPath`" --no-first-run `"https://social-growth-ai-nu.vercel.app`""
-$shortcut.WorkingDirectory = $ExtPath
-$shortcut.Description      = "Open Social Growth AI with the Smart Content Import Extension"
+$shortcut.Arguments        = "--load-extension=`"$InstallDir`" --no-first-run --no-default-browser-check `"https://social-growth-ai-nu.vercel.app`""
+$shortcut.WorkingDirectory = $InstallDir
+$shortcut.Description      = "Open Social Growth AI with Smart Content Import Extension"
 $shortcut.IconLocation     = $chrome
 $shortcut.Save()
+Write-Host "  Desktop shortcut 'Social Growth AI' created." -ForegroundColor Green
 
-Write-Host "  Shortcut created on Desktop." -ForegroundColor Green
+# ── Launch Chrome via --load-extension, opening chrome://extensions ───────────
+Write-Host ""
+Write-Host "  Launching Chrome with the extension active..." -ForegroundColor Cyan
 
-# ── Done ──────────────────────────────────────────────────────────────────────
+$extUrl     = "chrome://extensions"
+$siteUrl    = "https://social-growth-ai-nu.vercel.app"
+$launchArgs = "--load-extension=`"$InstallDir`" --no-first-run --no-default-browser-check `"$extUrl`""
+Start-Process -FilePath $chrome -ArgumentList $launchArgs
+
+Start-Sleep -Seconds 4
+
+# ── Print instructions ─────────────────────────────────────────────────────────
 Write-Host ""
-Write-Host "  ==========================================" -ForegroundColor Green
-Write-Host "   Extension installed! Chrome is opening." -ForegroundColor Green
-Write-Host "  ==========================================" -ForegroundColor Green
+Write-Host "  =================================================" -ForegroundColor Green
+Write-Host "   Extension loaded! Chrome is now open." -ForegroundColor Green
+Write-Host "  =================================================" -ForegroundColor Green
 Write-Host ""
-Write-Host "  HOW TO SEE THE EXTENSION:" -ForegroundColor White
-Write-Host "   - Look for the PUZZLE PIECE icon (top-right of Chrome)" -ForegroundColor Cyan
-Write-Host "   - Click it, find 'Social Growth AI', click the PIN" -ForegroundColor Cyan
-Write-Host "   - The bolt icon will appear permanently in your toolbar" -ForegroundColor Cyan
+Write-Host "  STEP-BY-STEP - DO THIS NOW:" -ForegroundColor White
 Write-Host ""
-Write-Host "  IMPORTANT - FOR FUTURE USE:" -ForegroundColor Yellow
-Write-Host "   Always open Chrome via the 'Social Growth AI (Extension)'" -ForegroundColor Yellow
-Write-Host "   shortcut on your Desktop to keep the extension active." -ForegroundColor Yellow
+Write-Host "   [1] Chrome opened to the Extensions page" -ForegroundColor Cyan
+Write-Host "       You should see 'Social Growth AI - Smart Import' listed" -ForegroundColor Gray
+Write-Host ""
+Write-Host "   [2] Make sure its toggle is turned ON (blue)" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "   [3] Click the PUZZLE PIECE icon in Chrome toolbar (top-right)" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "   [4] Find 'Social Growth AI' and click the PIN icon" -ForegroundColor Cyan
+Write-Host "       The bolt icon will now PERMANENTLY appear in your toolbar!" -ForegroundColor Green
+Write-Host ""
+Write-Host "  EVERY TIME YOU WANT TO USE IT:" -ForegroundColor Yellow
+Write-Host "   Use the 'Social Growth AI' shortcut on your Desktop." -ForegroundColor Yellow
+Write-Host "   This keeps the extension active in Chrome." -ForegroundColor Yellow
 Write-Host ""
 exit 0
