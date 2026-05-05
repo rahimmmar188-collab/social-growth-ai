@@ -50,16 +50,6 @@ const features = [
 export default function ExtensionPage() {
   const [downloaded, setDownloaded] = useState(false);
 
-  const handleDownload = () => {
-    setDownloaded(true);
-    const link = document.createElement("a");
-    link.href = "/extension-download/social-growth-ai-extension.zip";
-    link.download = "social-growth-ai-extension.zip";
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-  };
-
   return (
     <main className="min-h-screen bg-gradient-to-br from-[#0a0a12] via-[#0d0d1c] to-[#0a0a12]">
       <div className="max-w-4xl mx-auto px-5 py-16 space-y-14">
@@ -110,9 +100,11 @@ export default function ExtensionPage() {
             <span className="text-white/40 text-xs ml-2">100% Free</span>
           </div>
 
-          <button
+          <a
             id="download-extension-btn"
-            onClick={handleDownload}
+            href="/extension-download/social-growth-ai-extension.zip"
+            download="social-growth-ai-extension.zip"
+            onClick={() => setDownloaded(true)}
             className={`group inline-flex items-center gap-3 px-10 py-4 rounded-xl font-bold text-white text-lg transition-all duration-200 ${
               downloaded
                 ? "bg-emerald-600 shadow-lg shadow-emerald-600/25"
@@ -124,7 +116,7 @@ export default function ExtensionPage() {
             ) : (
               <><Download size={22} className="group-hover:animate-bounce" /> Download Extension (.zip)</>
             )}
-          </button>
+          </a>
 
           <p className="mt-5 text-white/30 text-xs flex items-center justify-center gap-1.5">
             <Shield size={11} /> Chrome Manifest V3 &bull; Developer Mode &bull; No account required

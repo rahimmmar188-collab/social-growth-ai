@@ -11,24 +11,8 @@ chrome.runtime.onMessage.addListener((msg) => {
 // Auto-open the popup when the extension is installed via the script
 chrome.runtime.onInstalled.addListener((details) => {
   if (details.reason === "install") {
-    // Attempt to open the popup HTML in a standalone popup window
-    // positioned near the top right of the screen
-    chrome.system.display.getInfo((displays) => {
-      const primaryDisplay = displays.find((d) => d.isPrimary) || displays[0];
-      const width = 420;
-      const height = 650;
-      const left = primaryDisplay ? primaryDisplay.workArea.width - width - 20 : 9999;
-      const top = primaryDisplay ? primaryDisplay.workArea.top + 20 : 20;
-
-      chrome.windows.create({
-        url: "popup.html",
-        type: "popup",
-        width: width,
-        height: height,
-        left: left,
-        top: top
-      });
-    });
+    // Open the extension's UI in a new tab to act as a notification/onboarding
+    chrome.tabs.create({ url: "popup.html" });
   }
 });
 
