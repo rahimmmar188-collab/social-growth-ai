@@ -57,6 +57,16 @@ New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 Copy-Item -Path "$SourcePath\*" -Destination $InstallDir -Recurse -Force
 Write-Host "  Files installed successfully." -ForegroundColor Green
 
+# ── Detect last-used Chrome profile to skip the profile picker ────────────────
+$ChromeLocalState = "$env:LOCALAPPDATA\Google\Chrome\User Data\Local State"
+$profileDir = "Default"
+try {
+    $localState = Get-Content -LiteralPath $ChromeLocalState -Raw | ConvertFrom-Json
+    $lastUsed   = $localState.profile.last_used
+    if ($lastUsed) { $profileDir = $lastUsed }
+} catch {}
+Write-Host "  Chrome profile: $profileDir" -ForegroundColor Gray
+
 # ── Close Chrome so --load-extension takes effect ─────────────────────────────
 $running = Get-Process -Name "chrome" -ErrorAction SilentlyContinue
 if ($running) {
@@ -74,7 +84,7 @@ $lnkPath  = "$desktop\Social Growth AI.lnk"
 $wsh      = New-Object -ComObject WScript.Shell
 $shortcut = $wsh.CreateShortcut($lnkPath)
 $shortcut.TargetPath       = $chrome
-$shortcut.Arguments        = "--load-extension=`"$InstallDir`" --no-first-run --no-default-browser-check `"https://social-growth-ai-nu.vercel.app`""
+$shortcut.Arguments        = "--profile-directory=`"$profileDir`" --load-extension=`"$InstallDir`" --no-first-run --no-default-browser-check `"https://social-growth-ai-nu.vercel.app`""
 $shortcut.WorkingDirectory = $InstallDir
 $shortcut.Description      = "Open Social Growth AI with Smart Content Import Extension"
 $shortcut.IconLocation     = $chrome
@@ -87,7 +97,7 @@ Write-Host "  Launching Chrome with the extension active..." -ForegroundColor Cy
 
 $extUrl     = "chrome://extensions"
 $siteUrl    = "https://social-growth-ai-nu.vercel.app"
-$launchArgs = "--load-extension=`"$InstallDir`" --no-first-run --no-default-browser-check `"$extUrl`""
+$launchArgs = "--profile-directory=`"$profileDir`" --load-extension=`"$InstallDir`" --no-first-run --no-default-browser-check `"$extUrl`""
 Start-Process -FilePath $chrome -ArgumentList $launchArgs
 
 Start-Sleep -Seconds 4
