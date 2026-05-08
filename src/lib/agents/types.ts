@@ -50,6 +50,94 @@ export interface URLResult {
   postingPlaybook: { platform: string; optimalTime: string; hashtagMix: string[]; abTest: string };
 }
 
+// ── Multimodal analysis result (from real video processing) ──────────────────
+export interface MultimodalURLResult {
+  viralAutopsy: string;
+
+  hookAnalysis: {
+    first3Seconds: string;
+    hookType: string;
+    hookPhrase: string;
+    emotionalTrigger: string;
+    attentionMechanism: string;
+  };
+
+  contentDNA: {
+    hookType: string;
+    pacing: string;
+    tensionPayoff: string;
+    ctaPlacement: string;
+    format: string;
+  };
+
+  audioIntelligence: {
+    hookPhrase: string;
+    fullTranscript: string;
+    speakingPace: string;
+    emotionTone: string;
+    keyPhrases: string[];
+  };
+
+  onScreenText: {
+    hookText: string;
+    ctaText: string;
+    subtitles: string;
+    otherText: string[];
+  };
+
+  retentionStrategy: {
+    sceneCount: number;
+    avgSceneDuration: string;
+    patternInterrupts: string[];
+    curiosityLoops: string[];
+    pacingStyle: string;
+  };
+
+  editingAnalysis: {
+    cutStyle: string;
+    visualRhythm: string;
+    cameraWork: string;
+    energyLevel: string;
+    productionQuality: string;
+  };
+
+  ctaEffectiveness: {
+    visualCTA: string;
+    spokenCTA: string;
+    timing: string;
+    strength: "strong" | "moderate" | "weak";
+    improvement: string;
+  };
+
+  ethicalBorrow: string[];
+  outperformAnalysis: string[];
+  recreatedVersion: string;
+
+  viralityScorecard: {
+    hookStrength: number;
+    emotionalResonance: number;
+    shareability: number;
+    ctaClarity: number;
+    productionValue: number;
+    overall: number;
+  };
+
+  audiencePsychology: string;
+  creatorStyleSignature: string;
+  weaknessesAndImprovements: string[];
+
+  postingPlaybook: {
+    platform: string;
+    optimalTime: string;
+    hashtagMix: string[];
+    abTest: string;
+  };
+
+  contentNiche: string;
+  dataConfidence: "HIGH" | "MEDIUM" | "LOW";
+  dataSource: "multimodal" | "caption-only" | "metadata-only";
+}
+
 export interface GapAnalysisResult {
   gapSummary: string;
   hookComparison: {

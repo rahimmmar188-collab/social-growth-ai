@@ -4,27 +4,27 @@
 const DEFAULT_APP_URL = "https://social-growth-ai-nu.vercel.app";
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
-const platformDot   = document.getElementById("platformDot");
-const platformLabel = document.getElementById("platformLabel");
-const previewBox    = document.getElementById("previewBox");
-const previewText   = document.getElementById("previewText");
-const previewChars  = document.getElementById("previewChars");
-const warningBox    = document.getElementById("warningBox");
-const warningText   = document.getElementById("warningText");
-const sendBtn       = document.getElementById("sendBtn");
-const btnIcon       = document.getElementById("btnIcon");
-const btnText       = document.getElementById("btnText");
-const statusSuccess = document.getElementById("statusIdle");   // reused id
-const statusError   = document.getElementById("statusError");
-const errorText     = document.getElementById("errorText");
-const openAppLink   = document.getElementById("openAppLink");
+const platformDot    = document.getElementById("platformDot");
+const platformLabel  = document.getElementById("platformLabel");
+const previewBox     = document.getElementById("previewBox");
+const previewText    = document.getElementById("previewText");
+const previewChars   = document.getElementById("previewChars");
+const warningBox     = document.getElementById("warningBox");
+const warningText    = document.getElementById("warningText");
+const sendBtn        = document.getElementById("sendBtn");
+const btnIcon        = document.getElementById("btnIcon");
+const btnText        = document.getElementById("btnText");
+const statusSuccess  = document.getElementById("statusIdle");
+const statusError    = document.getElementById("statusError");
+const errorText      = document.getElementById("errorText");
+const openAppLink    = document.getElementById("openAppLink");
 const settingsToggle = document.getElementById("settingsToggle");
-const settingsPanel = document.getElementById("settingsPanel");
-const appUrlInput   = document.getElementById("appUrlInput");
+const settingsPanel  = document.getElementById("settingsPanel");
+const appUrlInput    = document.getElementById("appUrlInput");
 const saveSettingsBtn = document.getElementById("saveSettings");
 
 // ── State ─────────────────────────────────────────────────────────────────────
-let extractedData = null; // { content, platform, url, title }
+let extractedData = null; // full structured object from contentScript
 let appUrl = DEFAULT_APP_URL;
 
 // ── Platform helpers ──────────────────────────────────────────────────────────
@@ -93,18 +93,14 @@ chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
   setPlatformUI(platform, supported);
 
   if (!supported) {
-    showWarning(
-      "Navigate to Instagram, TikTok, LinkedIn, Twitter/X, or Facebook to extract content."
-    );
+    showWarning("Navigate to Instagram, TikTok, LinkedIn, Twitter/X, or Facebook to extract content.");
     return;
   }
 
-  // Inject content script if not already there, then message it
+  // Inject content script if needed, then extract
   try {
-    // Try sending message first (script might already be injected)
     let result = await tryExtract(tab.id);
     if (!result) {
-      // Inject manually and retry
       await chrome.scripting.executeScript({
         target: { tabId: tab.id },
         files: ["contentScript.js"],
@@ -114,12 +110,14 @@ chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
 
     if (result && result.content && result.content.length > 10) {
       extractedData = { ...result, platform };
-      showPreview(result.content, result.content.length);
+
+      // Show what was captured
+      const hasVideo = !!result.videoUrl;
+      const captionLen = (result.caption || result.content || "").length;
+      showPreview(result.caption || result.content, captionLen, hasVideo);
       sendBtn.disabled = false;
     } else {
-      showWarning(
-        "No caption found. Try selecting the post text first, then click the extension."
-      );
+      showWarning("No caption found. Try selecting the post text first, then click the extension.");
     }
   } catch (err) {
     console.warn("[SocialGrowthAI] Extract error:", err);
@@ -132,19 +130,14 @@ function tryExtract(tabId) {
   return new Promise((resolve) => {
     try {
       chrome.tabs.sendMessage(tabId, { action: "EXTRACT_CONTENT" }, (response) => {
-        if (chrome.runtime.lastError) {
-          resolve(null);
-        } else {
-          resolve(response || null);
-        }
+        if (chrome.runtime.lastError) resolve(null);
+        else resolve(response || null);
       });
-    } catch {
-      resolve(null);
-    }
+    } catch { resolve(null); }
   });
 }
 
-/** Detect platform from URL string */
+/** Detect platform from URL */
 function detectPlatformFromUrl(url) {
   if (!url) return "unknown";
   if (url.includes("instagram.com")) return "instagram";
@@ -156,9 +149,13 @@ function detectPlatformFromUrl(url) {
 }
 
 // ── Show preview ──────────────────────────────────────────────────────────────
-function showPreview(content, charCount) {
+function showPreview(content, charCount, hasVideoUrl) {
   previewText.textContent = content;
-  previewChars.textContent = `${charCount} characters detected`;
+
+  const videoTag = hasVideoUrl
+    ? " · 🎬 Video URL captured"
+    : " · ⚠ No direct video URL (captions only)";
+  previewChars.textContent = `${charCount} chars${videoTag}`;
   previewBox.style.display = "block";
   warningBox.style.display = "none";
 }
@@ -174,27 +171,33 @@ function showWarning(msg) {
 sendBtn.addEventListener("click", async () => {
   if (!extractedData) return;
 
-  // Set sending state
   sendBtn.disabled = true;
   sendBtn.classList.add("sending");
   btnText.textContent = "Sending…";
   btnIcon.classList.add("spin");
-  btnIcon.innerHTML = `<svg width="15" height="15" viewBox="0 0 15 15" fill="none">
-    <path d="M7.5 2v11M2 7.5h11" stroke="white" stroke-width="1.5" stroke-linecap="round"/>
-  </svg>`;
+  setSpinIcon();
 
   statusSuccess.style.display = "none";
   statusError.style.display = "none";
 
   try {
-    const endpoint = `${appUrl}/api/extract`;
-    const res = await fetch(endpoint, {
+    const res = await fetch(`${appUrl}/api/extract`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        content:  extractedData.content,
+        // Legacy field (backward compat)
+        content: extractedData.caption || extractedData.content,
+
+        // New structured fields for multimodal pipeline
+        videoUrl:   extractedData.videoUrl   || "",
+        caption:    extractedData.caption    || extractedData.content || "",
+        engagement: extractedData.engagement || { likes: "0", views: "0" },
+        creator:    extractedData.creator    || { username: "", profileUrl: "" },
+        postMeta:   extractedData.postMeta   || { postUrl: extractedData.url, timestamp: new Date().toISOString() },
+
+        // Standard fields
         platform: extractedData.platform,
-        url:      extractedData.url,
+        url:      extractedData.postMeta?.postUrl || extractedData.url,
       }),
     });
 
@@ -203,13 +206,9 @@ sendBtn.addEventListener("click", async () => {
       throw new Error(`Server returned ${res.status}: ${body}`);
     }
 
-    // ── Success ──
     const json = await res.json();
-    console.log("[SocialGrowthAI] Sent:", json.sessionId);
-
-    // Store sessionId locally for cleanup if needed
+    console.log("[SocialGrowthAI] Sent:", json.sessionId, "| videoUrl:", !!extractedData.videoUrl);
     chrome.storage.session && chrome.storage.session.set({ lastSessionId: json.sessionId });
-
     showSuccess();
   } catch (err) {
     console.error("[SocialGrowthAI] Send error:", err);
@@ -225,17 +224,10 @@ function showSuccess() {
   sendBtn.classList.remove("sending");
   btnText.textContent = "Sent!";
   btnIcon.classList.remove("spin");
-  btnIcon.innerHTML = `<svg width="15" height="15" viewBox="0 0 15 15" fill="none">
-    <path d="M3 7.5l3 3 6-6" stroke="white" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
-  </svg>`;
-
+  setCheckIcon();
   statusSuccess.style.display = "block";
   statusError.style.display = "none";
-
-  // Auto-open the app after 1.5s
-  setTimeout(() => {
-    chrome.tabs.create({ url: appUrl + "/spy-recreate" });
-  }, 1500);
+  setTimeout(() => { chrome.tabs.create({ url: appUrl + "/spy-recreate" }); }, 1500);
 }
 
 function showError(msg) {
@@ -244,6 +236,16 @@ function showError(msg) {
   statusSuccess.style.display = "none";
 }
 
+function setSpinIcon() {
+  btnIcon.innerHTML = `<svg width="15" height="15" viewBox="0 0 15 15" fill="none">
+    <path d="M7.5 2v11M2 7.5h11" stroke="white" stroke-width="1.5" stroke-linecap="round"/>
+  </svg>`;
+}
+function setCheckIcon() {
+  btnIcon.innerHTML = `<svg width="15" height="15" viewBox="0 0 15 15" fill="none">
+    <path d="M3 7.5l3 3 6-6" stroke="white" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+  </svg>`;
+}
 function resetBtnIcon() {
   btnIcon.classList.remove("spin");
   btnIcon.innerHTML = `<svg width="15" height="15" viewBox="0 0 15 15" fill="none">

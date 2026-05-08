@@ -4,10 +4,9 @@ import React, { useState, useCallback, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useAppStore } from "@/lib/store";
 import { useStreaming } from "@/hooks/use-streaming";
-import { URLResult } from "@/lib/agents/types";
+import { MultimodalURLResult } from "@/lib/agents/types";
 import {
   scoreConfidence,
-  buildContentBody,
   isRestrictedPlatform,
   type ContentConfidence,
 } from "@/lib/content-pipeline";
@@ -80,9 +79,31 @@ export default function SpyRecreatePage() {
   const [showPreview, setShowPreview] = useState(false);
 
   const detectedPlatform = url ? detectPlatform(url) : "";
-  const { data, isStreaming, isRefined, error, startStreaming } = useStreaming<URLResult>();
+  const { data, isStreaming, isRefined, error, startStreaming, reset } = useStreaming<MultimodalURLResult>();
 
-  // ── Part 7: Auto-import extension content on page load ────────────────────────
+  // ── Multimodal pipeline state ─────────────────────────────────────────────
+  type PipelineStage = "idle"|"downloading"|"transcribing"|"extracting_text"|"analyzing_vision"|"reasoning"|"done"|"error";
+  const PIPELINE_STAGES: { key: PipelineStage; icon: string; label: string }[] = [
+    { key: "downloading",      icon: "📥", label: "Downloading video" },
+    { key: "transcribing",     icon: "🎤", label: "Extracting speech (Whisper)" },
+    { key: "extracting_text",  icon: "🔤", label: "Reading on-screen text (OCR)" },
+    { key: "analyzing_vision", icon: "🎬", label: "Analyzing scenes & keyframes" },
+    { key: "reasoning",        icon: "🧠", label: "Generating viral intelligence" },
+  ];
+  const [pipelineStage, setPipelineStage] = useState<PipelineStage>("idle");
+  const [pipelineError, setPipelineError] = useState("");
+  const [mediaSignals, setMediaSignals] = useState<{
+    transcript?: string; hookPhrase?: string; ocrTexts?: {frame_index:number;text:string}[];
+    durationSeconds?: number; sceneCount?: number; audioEnergy?: string;
+    visualAnalysis?: Record<string,unknown>; fallback?: boolean;
+  } | null>(null);
+
+  // Extension video + engagement
+  const [extensionVideoUrl, setExtensionVideoUrl] = useState("");
+  const [extensionEngagement, setExtensionEngagement] = useState<{likes:string;views:string}|null>(null);
+  const [extensionCreator, setExtensionCreator] = useState<{username:string;profileUrl:string}|null>(null);
+
+  // ── Auto-import extension content on page load ──────────────────────────────
   useEffect(() => {
     if (didAutoImport.current) return;
     didAutoImport.current = true;
@@ -95,9 +116,12 @@ export default function SpyRecreatePage() {
           setExtensionSessionId(ext.sessionId || null);
           setConfidence("HIGH");
           setShowFallback(false);
+          if (ext.videoUrl) setExtensionVideoUrl(ext.videoUrl);
+          if (ext.engagement) setExtensionEngagement(ext.engagement);
+          if (ext.creator) setExtensionCreator(ext.creator);
         }
       })
-      .catch(() => { /* silent — no content available */ });
+      .catch(() => {});
   }, []);
 
   // ── Part 9: Session cleanup after analysis completes ──────────────────────────
@@ -157,6 +181,9 @@ export default function SpyRecreatePage() {
         setConfidence("HIGH");
         setShowFallback(false);
         setFallbackSubmitted(false);
+        if (ext.videoUrl)   setExtensionVideoUrl(ext.videoUrl);
+        if (ext.engagement) setExtensionEngagement(ext.engagement);
+        if (ext.creator)    setExtensionCreator(ext.creator);
       } else {
         alert("No content found from extension. Open the Social Growth AI extension on a social media post first.");
       }
@@ -170,6 +197,9 @@ export default function SpyRecreatePage() {
   const handleClearExtension = () => {
     setExtensionContent(null);
     setExtensionPlatform(null);
+    setExtensionVideoUrl("");
+    setExtensionEngagement(null);
+    setExtensionCreator(null);
     // Recompute confidence from metadata
     if (metadata) {
       const conf = isRestrictedPlatform(url) ? "LOW" : scoreConfidence(metadata);
@@ -186,39 +216,106 @@ export default function SpyRecreatePage() {
     setConfidence("HIGH");
   };
 
-  // ── Main analyze handler ──────────────────────────────────────────────────────
+  // ── Main analyze handler — full multimodal pipeline ─────────────────────────
   const handleAnalyze = useCallback(async () => {
     if (!niche.trim()) return;
     if (!url.trim() && !extensionContent) return;
 
     incrementUsage();
     setShowPreview(true);
+    reset();
+    setPipelineError("");
+    setMediaSignals(null);
 
-    const metaObj = metadata || { url, title: url };
-    const { body, source } = buildContentBody(
-      metaObj as Record<string, unknown>,
-      pastedContent || undefined,
-      extensionContent || undefined
-    );
+    const platform = detectedPlatform || extensionPlatform || "Unknown";
+    const caption   = extensionContent || pastedContent || (metadata as Record<string,string>|null)?.description || "";
+    const videoUrl  = extensionVideoUrl || "";
 
-    const finalConfidence = extensionContent
-      ? "HIGH"
-      : fallbackSubmitted && pastedContent
-      ? "HIGH"
-      : confidence || "LOW";
+    let signals: typeof mediaSignals = null;
 
-    await startStreaming("/api/agents/url", {
-      metadata: metaObj,
+    // ── Step 1: Process video (FFmpeg + Whisper + OCR) ───────────────────────
+    if (videoUrl) {
+      try {
+        setPipelineStage("downloading");
+        const pRes = await fetch("/api/media/process", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ videoUrl, maxFrames: 12 }),
+        });
+        const pData = await pRes.json();
+
+        if (!pData.fallback) {
+          setPipelineStage("transcribing");
+          await new Promise(r => setTimeout(r, 400)); // visual pause
+
+          setPipelineStage("extracting_text");
+          await new Promise(r => setTimeout(r, 400));
+
+          // ── Step 2: Vision analysis ────────────────────────────────────────
+          setPipelineStage("analyzing_vision");
+          let visualAnalysis = null;
+          if (pData.frames?.length > 0) {
+            try {
+              const vRes = await fetch("/api/media/vision", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  frames:    pData.frames,
+                  transcript: pData.transcript,
+                  ocrTexts:  pData.ocr_texts,
+                }),
+              });
+              visualAnalysis = await vRes.json();
+            } catch { /* vision non-fatal */ }
+          }
+
+          signals = {
+            transcript:      pData.transcript,
+            hookPhrase:      pData.hook_phrase,
+            ocrTexts:        pData.ocr_texts,
+            durationSeconds: pData.duration_seconds,
+            sceneCount:      pData.scene_count,
+            audioEnergy:     pData.audio_energy,
+            visualAnalysis,
+            fallback:        false,
+          };
+        } else {
+          signals = { fallback: true };
+        }
+      } catch {
+        signals = { fallback: true };
+      }
+    } else {
+      signals = { fallback: true };
+    }
+
+    setMediaSignals(signals);
+
+    // ── Step 3: Final reasoning (streaming) ──────────────────────────────────
+    setPipelineStage("reasoning");
+    await startStreaming("/api/agents/multimodal-url", {
       niche,
-      platform: detectedPlatform || extensionPlatform || "Unknown",
+      platform,
+      caption,
+      engagement:      extensionEngagement,
+      creator:         extensionCreator,
+      visualAnalysis:  signals?.visualAnalysis || null,
+      transcript:      signals?.transcript || "",
+      hookPhrase:      signals?.hookPhrase || "",
+      ocrTexts:        signals?.ocrTexts || [],
+      durationSeconds: signals?.durationSeconds || 0,
+      sceneCount:      signals?.sceneCount || 0,
+      audioEnergy:     signals?.audioEnergy || "unknown",
+      confidence:      signals?.fallback ? "LOW" : "HIGH",
       userNote,
-      contentBody: body,
-      confidence: finalConfidence,
     });
+
+    setPipelineStage("done");
   }, [
     url, niche, userNote, metadata, extensionContent, extensionPlatform,
+    extensionVideoUrl, extensionEngagement, extensionCreator,
     pastedContent, fallbackSubmitted, confidence, detectedPlatform,
-    incrementUsage, startStreaming, buildContentBody,
+    incrementUsage, startStreaming, reset,
   ]);
 
   // ── Effective confidence for display ─────────────────────────────────────────
@@ -254,7 +351,7 @@ export default function SpyRecreatePage() {
           Spy &amp; Recreate
         </h1>
         <p className="text-muted-foreground text-sm mt-1">
-          Paste any viral reel, post, or video URL — get a 7-card intelligence report
+          Real multimodal video intelligence — FFmpeg · Whisper · OCR · Vision AI
         </p>
       </div>
 
@@ -523,10 +620,55 @@ export default function SpyRecreatePage() {
         </div>
       </GlassCard>
 
-      {/* Loading Skeletons */}
-      {isStreaming && !data && (
+      {/* ── Animated Pipeline Stages ── */}
+      {(isStreaming || (pipelineStage !== "idle" && pipelineStage !== "done" && pipelineStage !== "error")) && (
+        <GlassCard hover={false}>
+          <div className="space-y-3">
+            <p className="text-xs font-medium text-muted-foreground tracking-widest uppercase">Multimodal Processing Pipeline</p>
+            <div className="space-y-2">
+              {PIPELINE_STAGES.map((s, i) => {
+                const stageOrder = ["downloading","transcribing","extracting_text","analyzing_vision","reasoning"];
+                const currentIdx = stageOrder.indexOf(pipelineStage);
+                const stageIdx = stageOrder.indexOf(s.key);
+                const isDone    = stageIdx < currentIdx || (pipelineStage === "done");
+                const isActive  = stageIdx === currentIdx;
+                return (
+                  <motion.div
+                    key={s.key}
+                    initial={{ opacity: 0, x: -8 }}
+                    animate={{ opacity: 1, x: 0 }}
+                    transition={{ delay: i * 0.08 }}
+                    className={`flex items-center gap-3 px-3 py-2 rounded-lg transition-colors ${
+                      isActive  ? "bg-violet/10 border border-violet/20" :
+                      isDone    ? "bg-emerald-500/5 border border-emerald-500/10" :
+                      "bg-white/[0.02] border border-white/[0.04]"
+                    }`}
+                  >
+                    <span className={isActive ? "animate-pulse" : ""}>{s.icon}</span>
+                    <span className={`text-sm flex-1 ${
+                      isActive ? "text-violet font-medium" :
+                      isDone   ? "text-emerald-400" :
+                      "text-muted-foreground"
+                    }`}>{s.label}</span>
+                    {isDone    && <span className="text-emerald-400 text-xs">✓</span>}
+                    {isActive  && <span className="text-violet text-xs animate-pulse">running…</span>}
+                  </motion.div>
+                );
+              })}
+            </div>
+            {pipelineStage === "reasoning" && !data && (
+              <div className="space-y-2 pt-1">
+                {[...Array(3)].map((_,i) => <SkeletonCard key={i} lines={2} />)}
+              </div>
+            )}
+          </div>
+        </GlassCard>
+      )}
+
+      {/* Simple skeleton when no videoUrl (text-only mode) */}
+      {isStreaming && !data && pipelineStage === "idle" && (
         <div className="space-y-3">
-          {[...Array(7)].map((_, i) => <SkeletonCard key={i} lines={3 + (i % 3)} />)}
+          {[...Array(5)].map((_, i) => <SkeletonCard key={i} lines={3 + (i % 3)} />)}
         </div>
       )}
 
@@ -569,7 +711,67 @@ export default function SpyRecreatePage() {
               />
             </div>
 
-            {/* 7 Intelligence Cards */}
+            {/* ── Multimodal Signal Cards (when video was processed) ── */}
+            {mediaSignals && !mediaSignals.fallback && [
+              {
+                title: "Hook Analysis", emoji: "🎯",
+                content: data.hookAnalysis, type: "object",
+              },
+              {
+                title: "Audio Intelligence", emoji: "🎤",
+                content: data.audioIntelligence, type: "object",
+              },
+              {
+                title: "On-Screen Text (OCR)", emoji: "🔤",
+                content: data.onScreenText, type: "object",
+              },
+              {
+                title: "Retention Strategy", emoji: "🔄",
+                content: data.retentionStrategy, type: "object",
+              },
+              {
+                title: "Editing Analysis", emoji: "✂️",
+                content: data.editingAnalysis, type: "object",
+              },
+              {
+                title: "CTA Effectiveness", emoji: "📣",
+                content: data.ctaEffectiveness, type: "object",
+              },
+            ].map((card, i) => card?.content ? (
+              <GlassCard key={`mm-${i}`}>
+                <div className="flex items-start justify-between gap-2 mb-3">
+                  <h3 className="font-semibold text-sm text-foreground flex items-center gap-2">
+                    <span>{card.emoji}</span>{card.title}
+                  </h3>
+                  <span className="text-xs px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-medium">Multimodal</span>
+                </div>
+                <div className="space-y-1.5">
+                  {Object.entries(card.content as Record<string,unknown>).map(([k,v]) => (
+                    <div key={k} className="flex flex-col gap-0.5">
+                      <span className="text-xs text-muted-foreground font-medium capitalize">{k.replace(/([A-Z])/g," $1").trim()}</span>
+                      {Array.isArray(v)
+                        ? <ul className="space-y-0.5">{(v as string[]).map((item,j) => <li key={j} className="text-sm text-foreground/90 pl-3 border-l border-violet/20">{item}</li>)}</ul>
+                        : <p className="text-sm text-foreground/90">{String(v)}</p>
+                      }
+                    </div>
+                  ))}
+                </div>
+              </GlassCard>
+            ) : null)}
+
+            {/* Data confidence banner */}
+            {data.dataConfidence && (
+              <div className={`flex items-center gap-2 px-3 py-2 rounded-lg border text-xs ${
+                data.dataConfidence === "HIGH" ? "bg-emerald-500/10 border-emerald-500/20 text-emerald-400" :
+                data.dataConfidence === "MEDIUM" ? "bg-amber-500/10 border-amber-500/20 text-amber-400" :
+                "bg-white/[0.04] border-white/[0.06] text-muted-foreground"
+              }`}>
+                <span>{data.dataConfidence === "HIGH" ? "🟢" : data.dataConfidence === "MEDIUM" ? "🟡" : "⚪"}</span>
+                <span>Data confidence: <strong>{data.dataConfidence}</strong> · Source: {data.dataSource || "unknown"}</span>
+              </div>
+            )}
+
+            {/* ── Core 7 Intelligence Cards ── */}
             {[
               { title: "Viral Autopsy", emoji: "🔬", content: data.viralAutopsy, type: "text" },
               { title: "Content DNA Map", emoji: "🧬", content: data.contentDNA, type: "object" },

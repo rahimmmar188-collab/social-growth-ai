@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: social-growth-media-service
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: 8000
+      - key: WHISPER_MODEL
+        value: base.en
