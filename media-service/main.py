@@ -89,9 +89,12 @@ async def download_video(video_url: str, video_path: str) -> None:
                     "yt-dlp",
                     "--no-playlist",
                     "--max-filesize", "80m",
+                    # Force h264 + aac for OpenCV compatibility; fall back to best
                     "-f", (
-                        "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]"
-                        "/best[ext=mp4][height<=720]/best"
+                        "bestvideo[vcodec^=avc][height<=720]+bestaudio[ext=m4a]"
+                        "/bestvideo[vcodec^=avc]+bestaudio[ext=m4a]"
+                        "/bestvideo[height<=720]+bestaudio"
+                        "/best"
                     ),
                     "--merge-output-format", "mp4",
                     "-o", video_path,
@@ -107,6 +110,26 @@ async def download_video(video_url: str, video_path: str) -> None:
                 raise HTTPException(400, f"yt-dlp failed: {err}")
             if not os.path.exists(video_path) or os.path.getsize(video_path) < 1000:
                 raise HTTPException(400, "yt-dlp produced no output (private/geo-blocked content?)")
+
+            # Re-mux to ensure h264 + moov-at-start so OpenCV can seek properly.
+            # This is near-instant (stream copy only, no re-encode) for h264 files.
+            # If the stream is NOT h264, we transcode with ultrafast preset.
+            remuxed = video_path + ".remux.mp4"
+            subprocess.run(
+                [
+                    FFMPEG_CMD, "-y", "-i", video_path,
+                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                    "-c:a", "aac", "-b:a", "128k",
+                    "-movflags", "+faststart",
+                    remuxed,
+                ],
+                capture_output=True,
+                timeout=120,
+            )
+            if os.path.exists(remuxed) and os.path.getsize(remuxed) > 1000:
+                os.replace(remuxed, video_path)
+            # If re-mux failed, proceed with original file as-is
+
         except subprocess.TimeoutExpired:
             raise HTTPException(408, "yt-dlp timed out (>90s)")
     else:
