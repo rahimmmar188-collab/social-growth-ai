@@ -1,7 +1,7 @@
 """
-Social Growth AI — Media Processing Service
+Social Growth AI - Media Processing Service
 FastAPI microservice: FFmpeg frame extraction + faster-whisper + pytesseract OCR
-Deployed on Render.com (free tier). Called by Next.js on Vercel.
+Deployed on Railway. Called by Next.js on Vercel.
 """
 
 from __future__ import annotations
@@ -24,8 +24,8 @@ from pydantic import BaseModel
 from scenedetect import SceneManager, open_video
 from scenedetect.detectors import ContentDetector
 
-# ── App setup ─────────────────────────────────────────────────────────────────
-app = FastAPI(title="Social Growth AI — Media Service", version="1.0.0")
+# -- App setup -----------------------------------------------------------------
+app = FastAPI(title="Social Growth AI - Media Service", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -34,14 +34,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Whisper model (loaded once at startup, stays in memory) ───────────────────
+# -- Whisper model (loaded once at startup, stays in memory) -------------------
 WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL", "base.en")
 print(f"Loading Whisper model: {WHISPER_MODEL_NAME} ...")
 WHISPER = WhisperModel(WHISPER_MODEL_NAME, device="cpu", compute_type="int8")
 print("Whisper ready.")
 
-# ── Path configuration ────────────────────────────────────────────────────
-# Explicit paths for tools installed via winget (not on PATH)
+# -- Path configuration -------------------------------------------------------
+# Windows-specific winget FFmpeg paths (no-op on Linux/Docker)
 _FFMPEG_WINGET = (
     r"C:\Users\Rahim M\AppData\Local\Microsoft\WinGet\Packages"
     r"\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe"
@@ -49,7 +49,6 @@ _FFMPEG_WINGET = (
 )
 _FFPROBE_WINGET = _FFMPEG_WINGET.replace("ffmpeg.exe", "ffprobe.exe")
 
-# Use env override → winget path → fall back to bare command (Linux/Docker/PATH)
 FFMPEG_CMD  = os.getenv("FFMPEG_PATH",  _FFMPEG_WINGET if os.path.exists(_FFMPEG_WINGET)  else "ffmpeg")
 FFPROBE_CMD = os.getenv("FFPROBE_PATH", _FFPROBE_WINGET if os.path.exists(_FFPROBE_WINGET) else "ffprobe")
 
@@ -60,11 +59,78 @@ pytesseract.pytesseract.tesseract_cmd = os.getenv(
     _TESS_WIN if os.path.exists(_TESS_WIN) else "tesseract"
 )
 
-MAX_VIDEO_BYTES = 80 * 1024 * 1024  # 80 MB guard
+MAX_VIDEO_BYTES = 80 * 1024 * 1024  # 80 MB hard cap
+
+# -- Social media domains that require yt-dlp ---------------------------------
+SOCIAL_DOMAINS = (
+    "instagram.com", "tiktok.com", "youtube.com", "youtu.be",
+    "facebook.com", "fb.com", "twitter.com", "x.com",
+    "threads.net", "snapchat.com", "pinterest.com", "reddit.com",
+)
 
 
+def is_social_url(url: str) -> bool:
+    """True if the URL is a social media page requiring yt-dlp."""
+    return any(d in url.lower() for d in SOCIAL_DOMAINS)
 
-# ── Request / Response models ─────────────────────────────────────────────────
+
+async def download_video(video_url: str, video_path: str) -> None:
+    """
+    Download a video to video_path.
+      - Social media URLs  -> yt-dlp  (handles Instagram, TikTok, YouTube ...)
+      - Direct file URLs   -> httpx   (fast, lightweight for .mp4 CDN links)
+    Raises HTTPException on failure so the caller can return a proper error.
+    """
+    if is_social_url(video_url):
+        # yt-dlp: best mp4 up to 720p, merge to mp4 container
+        try:
+            result = subprocess.run(
+                [
+                    "yt-dlp",
+                    "--no-playlist",
+                    "--max-filesize", "80m",
+                    "-f", (
+                        "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]"
+                        "/best[ext=mp4][height<=720]/best"
+                    ),
+                    "--merge-output-format", "mp4",
+                    "-o", video_path,
+                    "--quiet",
+                    "--no-warnings",
+                    video_url,
+                ],
+                capture_output=True,
+                timeout=90,
+            )
+            if result.returncode != 0:
+                err = result.stderr.decode(errors="replace")[:300]
+                raise HTTPException(400, f"yt-dlp failed: {err}")
+            if not os.path.exists(video_path) or os.path.getsize(video_path) < 1000:
+                raise HTTPException(400, "yt-dlp produced no output (private/geo-blocked content?)")
+        except subprocess.TimeoutExpired:
+            raise HTTPException(408, "yt-dlp timed out (>90s)")
+    else:
+        # Direct HTTP download for CDN / direct .mp4 links
+        try:
+            async with httpx.AsyncClient(
+                timeout=30.0,
+                follow_redirects=True,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; SocialGrowthBot/1.0)"},
+            ) as client:
+                r = await client.get(video_url)
+                if r.status_code != 200:
+                    raise HTTPException(400, f"Video download failed: HTTP {r.status_code}")
+                if len(r.content) > MAX_VIDEO_BYTES:
+                    raise HTTPException(400, "Video too large (>80MB)")
+                with open(video_path, "wb") as f:
+                    f.write(r.content)
+        except httpx.TimeoutException:
+            raise HTTPException(408, "Video download timed out (>30s)")
+        except httpx.RequestError as e:
+            raise HTTPException(400, f"Download error: {e}")
+
+
+# -- Request / Response models -------------------------------------------------
 class ProcessRequest(BaseModel):
     video_url: str
     max_frames: int = 12
@@ -102,39 +168,23 @@ class ProcessResponse(BaseModel):
     fallback: bool = False
 
 
-# ── Health check ──────────────────────────────────────────────────────────────
+# -- Health check --------------------------------------------------------------
 @app.get("/health")
 def health():
     return {"status": "ok", "model": WHISPER_MODEL_NAME}
 
 
-# ── Main processing endpoint ───────────────────────────────────────────────────
+# -- Main processing endpoint --------------------------------------------------
 @app.post("/process", response_model=ProcessResponse)
 async def process_video(req: ProcessRequest):
     with tempfile.TemporaryDirectory() as tmp:
         video_path = os.path.join(tmp, "input.mp4")
         audio_path = os.path.join(tmp, "audio.wav")
 
-        # ── Step 1: Download video ────────────────────────────────────────────
-        try:
-            async with httpx.AsyncClient(
-                timeout=30.0,
-                follow_redirects=True,
-                headers={"User-Agent": "Mozilla/5.0 (compatible; SocialGrowthBot/1.0)"},
-            ) as client:
-                r = await client.get(req.video_url)
-                if r.status_code != 200:
-                    raise HTTPException(400, f"Video download failed: HTTP {r.status_code}")
-                if len(r.content) > MAX_VIDEO_BYTES:
-                    raise HTTPException(400, "Video too large (>80MB)")
-                with open(video_path, "wb") as f:
-                    f.write(r.content)
-        except httpx.TimeoutException:
-            raise HTTPException(408, "Video download timed out (>30s)")
-        except httpx.RequestError as e:
-            raise HTTPException(400, f"Download error: {e}")
+        # -- Step 1: Download video -------------------------------------------
+        await download_video(req.video_url, video_path)
 
-        # Verify video is readable
+        # Verify video is readable by OpenCV
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             raise HTTPException(422, "Downloaded file is not a valid video")
@@ -142,25 +192,25 @@ async def process_video(req: ProcessRequest):
         total_frames_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
         cap.release()
 
-        # ── Step 2: Extract audio → WAV ───────────────────────────────────────
+        # -- Step 2: Extract audio -> WAV -------------------------------------
         try:
             subprocess.run(
                 [
                     FFMPEG_CMD, "-y", "-i", video_path,
-                    "-vn",           # no video
-                    "-ar", "16000",  # 16kHz — optimal for Whisper
+                    "-vn",           # no video stream
+                    "-ar", "16000",  # 16kHz - optimal for Whisper
                     "-ac", "1",      # mono
                     "-c:a", "pcm_s16le",
                     audio_path,
                 ],
                 capture_output=True,
                 check=True,
-                timeout=30,
+                timeout=60,
             )
         except subprocess.CalledProcessError as e:
             raise HTTPException(500, f"Audio extraction failed: {e.stderr.decode()[:200]}")
 
-        # ── Step 3: Transcribe with faster-whisper ────────────────────────────
+        # -- Step 3: Transcribe with faster-whisper ---------------------------
         transcript = ""
         hook_phrase = ""
         segments_out: list[TranscriptSegment] = []
@@ -173,7 +223,7 @@ async def process_video(req: ProcessRequest):
                 beam_size=3,
                 best_of=3,
                 language="en",
-                vad_filter=True,          # skip silence
+                vad_filter=True,
                 vad_parameters={"min_silence_duration_ms": 500},
             )
             raw_segments = list(raw_segments)
@@ -194,10 +244,14 @@ async def process_video(req: ProcessRequest):
 
             # Simple energy estimate from word density
             words_per_sec = len(transcript.split()) / max(duration_seconds, 1)
-            audio_energy = "high" if words_per_sec > 3.5 else "medium" if words_per_sec > 1.5 else "low"
+            audio_energy = (
+                "high" if words_per_sec > 3.5
+                else "medium" if words_per_sec > 1.5
+                else "low"
+            )
 
-        except Exception as e:
-            # Transcription failure is non-fatal — continue with silent video
+        except Exception:
+            # Transcription failure is non-fatal - continue with silent video
             transcript = ""
             hook_phrase = ""
             audio_energy = "unknown"
@@ -206,20 +260,24 @@ async def process_video(req: ProcessRequest):
         if duration_seconds <= 0:
             try:
                 result = subprocess.run(
-                    [FFPROBE_CMD, "-v", "error", "-show_entries", "format=duration",
-                     "-of", "default=noprint_wrappers=1:nokey=1", video_path],
+                    [
+                        FFPROBE_CMD, "-v", "error",
+                        "-show_entries", "format=duration",
+                        "-of", "default=noprint_wrappers=1:nokey=1",
+                        video_path,
+                    ],
                     capture_output=True, text=True, timeout=10,
                 )
                 duration_seconds = float(result.stdout.strip() or "0")
             except Exception:
                 duration_seconds = total_frames_count / fps if fps > 0 else 30.0
 
-        # ── Step 4: Intelligent frame extraction ──────────────────────────────
+        # -- Step 4: Intelligent frame extraction -----------------------------
         frames, scene_count = extract_smart_frames(
             video_path, req.max_frames, duration_seconds, tmp
         )
 
-        # ── Step 5: OCR on each frame ─────────────────────────────────────────
+        # -- Step 5: OCR on each frame ----------------------------------------
         ocr_results: list[OCRResult] = []
         seen_ocr: set[str] = set()
 
@@ -236,7 +294,7 @@ async def process_video(req: ProcessRequest):
             except Exception:
                 pass
 
-        # ── Step 6: Encode frames as base64 ───────────────────────────────────
+        # -- Step 6: Encode frames as base64 ----------------------------------
         encoded_frames: list[FrameResult] = []
         for frame_data in frames:
             try:
@@ -264,7 +322,7 @@ async def process_video(req: ProcessRequest):
         )
 
 
-# ── Intelligent frame extraction ──────────────────────────────────────────────
+# -- Intelligent frame extraction ----------------------------------------------
 def extract_smart_frames(
     video_path: str,
     max_frames: int,
@@ -273,9 +331,9 @@ def extract_smart_frames(
 ) -> tuple[list[dict], int]:
     """
     Sampling strategy:
-    1. Hook zone — first 3 seconds, 1 frame every 1.5s
-    2. Scene transitions — via PySceneDetect ContentDetector
-    3. CTA zone — last 3 seconds, 1 frame every 1.5s
+    1. Hook zone   - first 3 seconds, 1 frame every ~1s
+    2. Scene transitions - via PySceneDetect ContentDetector
+    3. CTA zone    - last 3 seconds, 1 frame every ~1s
     Total capped at max_frames. Each frame saved as 720p JPEG (75% quality).
     """
     frames: list[dict] = []
@@ -342,7 +400,7 @@ def extract_smart_frames(
     return frames[:max_frames], scene_count
 
 
-# ── OCR helper ────────────────────────────────────────────────────────────────
+# -- OCR helper ----------------------------------------------------------------
 def run_ocr(img: Image.Image) -> str:
     """
     Pre-processes frame for better OCR accuracy:
@@ -366,10 +424,10 @@ def run_ocr(img: Image.Image) -> str:
 
         text = pytesseract.image_to_string(
             gray,
-            config="--psm 6 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 !?.,@#$%&*()-+:;'\"",
+            config='--psm 6 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 !?.,@#$%&*()-+:;\'"',
         ).strip()
 
-        # Filter noise: must be >3 meaningful chars
+        # Filter noise: must have at least 1 meaningful word (>2 chars)
         meaningful = [w for w in text.split() if len(w) > 2]
         if len(meaningful) < 1:
             return ""

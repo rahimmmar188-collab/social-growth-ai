@@ -229,7 +229,7 @@ export default function SpyRecreatePage() {
 
     const platform = detectedPlatform || extensionPlatform || "Unknown";
     const caption   = extensionContent || pastedContent || (metadata as Record<string,string>|null)?.description || "";
-    const videoUrl  = extensionVideoUrl || "";
+    const videoUrl  = extensionVideoUrl || url || "";
 
     let signals: typeof mediaSignals = null;
 

@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 
 export const runtime = "nodejs";
-export const maxDuration = 60;
+export const maxDuration = 120;
 
 const MEDIA_SERVICE_URL =
   process.env.MEDIA_SERVICE_URL || "http://127.0.0.1:8000";
