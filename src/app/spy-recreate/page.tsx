@@ -157,12 +157,19 @@ export default function SpyRecreatePage() {
       const conf = (meta.confidence || "LOW") as ContentConfidence;
       setConfidence(conf);
 
-      // If LOW confidence, show fallback UI automatically
-      if (conf === "LOW") setShowFallback(true);
+      // Only show paste-content fallback for truly unknown/non-downloadable URLs.
+      // Restricted social platforms (Instagram/TikTok/YouTube etc.) are handled
+      // directly by yt-dlp in the media service — no paste needed.
+      const isDownloadable = isRestrictedPlatform(url) || url.includes("youtube.com") || url.includes("youtu.be");
+      if (conf === "LOW" && !isDownloadable) setShowFallback(true);
     } catch {
-      setMetaError("Could not fetch URL metadata. Paste the content manually below.");
+      // Only show paste fallback for non-social URLs
+      const isDownloadable = isRestrictedPlatform(url) || url.includes("youtube.com") || url.includes("youtu.be");
+      if (!isDownloadable) {
+        setMetaError("Could not fetch URL metadata. Paste the content manually below.");
+        setShowFallback(true);
+      }
       setConfidence("LOW");
-      setShowFallback(true);
     } finally {
       setFetchingMeta(false);
     }
@@ -418,18 +425,19 @@ export default function SpyRecreatePage() {
               <motion.div
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}
-                className="flex items-start gap-2 text-xs text-amber-400/90"
+                className="flex items-start gap-2 text-xs text-emerald-400/80"
               >
-                <AlertTriangle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
+                <CheckCircle2 className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
                 <span>
-                  {detectedPlatform} restricts scraping. For accurate analysis,{" "}
+                  {detectedPlatform} video will be downloaded and analyzed directly via our media service.
+                  For even richer analysis (captions, engagement),{" "}
                   <button
                     onClick={() => setShowFallback(true)}
-                    className="underline hover:text-amber-300 transition-colors"
+                    className="underline hover:text-emerald-300 transition-colors"
                   >
-                    paste the caption below
-                  </button>{" "}
-                  or use the browser extension.
+                    paste the caption too
+                  </button>
+                  {" "}or use the browser extension.
                 </span>
               </motion.div>
             )}
