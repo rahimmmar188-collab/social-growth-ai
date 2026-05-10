@@ -215,9 +215,10 @@ async def process_video(req: ProcessRequest):
         total_frames_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
         cap.release()
 
-        # -- Step 2: Extract audio -> WAV -------------------------------------
+        # -- Step 2: Extract audio -> WAV (non-fatal if it fails) ------------
+        audio_ok = False
         try:
-            subprocess.run(
+            proc = subprocess.run(
                 [
                     FFMPEG_CMD, "-y", "-i", video_path,
                     "-vn",           # no video stream
@@ -227,57 +228,63 @@ async def process_video(req: ProcessRequest):
                     audio_path,
                 ],
                 capture_output=True,
-                check=True,
                 timeout=60,
             )
-        except subprocess.CalledProcessError as e:
-            raise HTTPException(500, f"Audio extraction failed: {e.stderr.decode()[:200]}")
+            audio_ok = proc.returncode == 0 and os.path.exists(audio_path) and os.path.getsize(audio_path) > 1000
+        except Exception:
+            audio_ok = False
 
-        # -- Step 3: Transcribe with faster-whisper ---------------------------
+        # -- Step 3: Transcribe with faster-whisper (non-fatal) ---------------
         transcript = ""
         hook_phrase = ""
         segments_out: list[TranscriptSegment] = []
         duration_seconds = 0.0
         audio_energy = "unknown"
 
-        try:
-            raw_segments, info = WHISPER.transcribe(
-                audio_path,
-                beam_size=3,
-                best_of=3,
-                language="en",
-                vad_filter=True,
-                vad_parameters={"min_silence_duration_ms": 500},
-            )
-            raw_segments = list(raw_segments)
-            duration_seconds = float(info.duration)
+        if audio_ok:
+            try:
+                raw_segments, info = WHISPER.transcribe(
+                    audio_path,
+                    beam_size=3,
+                    best_of=3,
+                    language="en",
+                    vad_filter=True,
+                    # Looser VAD: detects singing, fast speech, music vocals
+                    vad_parameters={
+                        "min_silence_duration_ms": 300,
+                        "speech_pad_ms": 200,
+                        "threshold": 0.3,
+                    },
+                )
+                raw_segments = list(raw_segments)
+                duration_seconds = float(info.duration)
 
-            for seg in raw_segments:
-                text = seg.text.strip()
-                segments_out.append(TranscriptSegment(
-                    start=round(seg.start, 2),
-                    end=round(seg.end, 2),
-                    text=text,
-                ))
+                for seg in raw_segments:
+                    text = seg.text.strip()
+                    segments_out.append(TranscriptSegment(
+                        start=round(seg.start, 2),
+                        end=round(seg.end, 2),
+                        text=text,
+                    ))
 
-            transcript = " ".join(s.text for s in segments_out)
-            hook_phrase = " ".join(
-                s.text for s in segments_out if s.start < 5.0
-            ).strip()
+                transcript = " ".join(s.text for s in segments_out)
+                hook_phrase = " ".join(
+                    s.text for s in segments_out if s.start < 5.0
+                ).strip()
 
-            # Simple energy estimate from word density
-            words_per_sec = len(transcript.split()) / max(duration_seconds, 1)
-            audio_energy = (
-                "high" if words_per_sec > 3.5
-                else "medium" if words_per_sec > 1.5
-                else "low"
-            )
+                # Simple energy estimate from word density
+                words_per_sec = len(transcript.split()) / max(duration_seconds, 1)
+                audio_energy = (
+                    "high" if words_per_sec > 3.5
+                    else "medium" if words_per_sec > 1.5
+                    else "low"
+                )
 
-        except Exception:
-            # Transcription failure is non-fatal - continue with silent video
-            transcript = ""
-            hook_phrase = ""
-            audio_energy = "unknown"
+            except Exception:
+                transcript = ""
+                hook_phrase = ""
+                audio_energy = "unknown"
+
 
         # Use ffprobe for accurate duration if whisper didn't get it
         if duration_seconds <= 0:
