@@ -7,9 +7,12 @@ Deployed on Railway. Called by Next.js on Vercel.
 from __future__ import annotations
 
 import base64
+import json
 import os
 import subprocess
 import tempfile
+import urllib.parse
+import urllib.request
 from typing import Optional
 
 import cv2
@@ -25,7 +28,7 @@ from scenedetect import SceneManager, open_video
 from scenedetect.detectors import ContentDetector
 
 # -- App setup -----------------------------------------------------------------
-app = FastAPI(title="Social Growth AI - Media Service", version="2.0.0")
+app = FastAPI(title="Social Growth AI - Media Service", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -59,98 +62,175 @@ pytesseract.pytesseract.tesseract_cmd = os.getenv(
     _TESS_WIN if os.path.exists(_TESS_WIN) else "tesseract"
 )
 
-MAX_VIDEO_BYTES = 80 * 1024 * 1024  # 80 MB hard cap
+MAX_VIDEO_BYTES = 100 * 1024 * 1024  # 100 MB hard cap
 
-# -- Social media domains that require yt-dlp ---------------------------------
+# -- Social media domains that may need yt-dlp --------------------------------
 SOCIAL_DOMAINS = (
-    "instagram.com", "tiktok.com", "youtube.com", "youtu.be",
+    "youtube.com", "youtu.be",
     "facebook.com", "fb.com", "twitter.com", "x.com",
     "threads.net", "snapchat.com", "pinterest.com", "reddit.com",
 )
 
+# -- TikTok CDN extraction via tikwm.com public API ---------------------------
+def get_tiktok_cdn_url(tiktok_url: str) -> str | None:
+    """
+    Use the tikwm.com public API to extract the TikTok video CDN URL.
+    This BYPASSES TikTok's IP block on Railway since we hit tikwm's servers,
+    not TikTok directly. Returns the direct mp4 CDN URL or None on failure.
+    """
+    try:
+        encoded = urllib.parse.quote(tiktok_url, safe="")
+        api_url = f"https://www.tikwm.com/api/?url={encoded}&hd=1"
+        req = urllib.request.Request(
+            api_url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Referer": "https://www.tikwm.com/",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode())
+        if data.get("code") == 0:
+            video_data = data.get("data", {})
+            # Prefer HD, fall back to standard quality
+            cdn = video_data.get("hdplay") or video_data.get("play") or ""
+            if cdn and cdn.startswith("http"):
+                print(f"[tikwm] CDN URL obtained: {cdn[:80]}...")
+                return cdn
+    except Exception as e:
+        print(f"[tikwm] Failed to get CDN URL: {e}")
+    return None
+
 
 def is_social_url(url: str) -> bool:
-    """True if the URL is a social media page requiring yt-dlp."""
+    """True if the URL is a social media page requiring yt-dlp (not TikTok/Instagram)."""
+    if ".mp4" in url.lower():
+        return False
+    # TikTok handled separately via tikwm
+    if "tiktok.com" in url.lower():
+        return False
+    # Instagram handled via extension — Railway IP is blocked
+    if "instagram.com" in url.lower():
+        return False
     return any(d in url.lower() for d in SOCIAL_DOMAINS)
+
+
+async def download_direct(video_url: str, video_path: str) -> None:
+    """Download a direct mp4/CDN URL using httpx (streaming to handle large files)."""
+    try:
+        async with httpx.AsyncClient(
+            timeout=60.0,
+            follow_redirects=True,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Referer": "https://www.tiktok.com/",
+            },
+        ) as client:
+            async with client.stream("GET", video_url) as r:
+                if r.status_code != 200:
+                    raise HTTPException(400, f"CDN download failed: HTTP {r.status_code}")
+                total = 0
+                with open(video_path, "wb") as f:
+                    async for chunk in r.aiter_bytes(chunk_size=65536):
+                        total += len(chunk)
+                        if total > MAX_VIDEO_BYTES:
+                            raise HTTPException(400, "Video too large (>100MB)")
+                        f.write(chunk)
+        if not os.path.exists(video_path) or os.path.getsize(video_path) < 1000:
+            raise HTTPException(400, "Downloaded file is empty")
+    except httpx.TimeoutException:
+        raise HTTPException(408, "Video download timed out (>60s)")
+    except httpx.RequestError as e:
+        raise HTTPException(400, f"Download error: {e}")
+
+
+async def download_with_ytdlp(video_url: str, video_path: str) -> None:
+    """Download via yt-dlp for YouTube and other supported platforms."""
+    try:
+        result = subprocess.run(
+            [
+                "yt-dlp",
+                "--no-playlist",
+                "--max-filesize", "100m",
+                # Force h264 + aac for OpenCV compatibility; fall back to best
+                "-f", (
+                    "bestvideo[vcodec^=avc][height<=720]+bestaudio[ext=m4a]"
+                    "/bestvideo[vcodec^=avc]+bestaudio[ext=m4a]"
+                    "/bestvideo[height<=720]+bestaudio"
+                    "/best"
+                ),
+                "--merge-output-format", "mp4",
+                "-o", video_path,
+                "--quiet",
+                "--no-warnings",
+                video_url,
+            ],
+            capture_output=True,
+            timeout=120,
+        )
+        if result.returncode != 0:
+            err = result.stderr.decode(errors="replace")[:400]
+            raise HTTPException(400, f"yt-dlp failed: {err}")
+        if not os.path.exists(video_path) or os.path.getsize(video_path) < 1000:
+            raise HTTPException(400, "yt-dlp produced no output (private/geo-blocked content?)")
+    except subprocess.TimeoutExpired:
+        raise HTTPException(408, "yt-dlp timed out (>120s)")
+
+
+async def remux_to_h264(video_path: str) -> None:
+    """
+    Re-mux to h264 mp4 with moov-at-start so OpenCV can seek properly.
+    Near-instant for h264 files (stream copy). Transcodes other codecs.
+    Non-fatal: if remux fails, proceed with original.
+    """
+    remuxed = video_path + ".remux.mp4"
+    try:
+        subprocess.run(
+            [
+                FFMPEG_CMD, "-y", "-i", video_path,
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart",
+                remuxed,
+            ],
+            capture_output=True,
+            timeout=120,
+        )
+        if os.path.exists(remuxed) and os.path.getsize(remuxed) > 1000:
+            os.replace(remuxed, video_path)
+    except Exception as e:
+        print(f"[remux] Non-fatal remux error: {e}")
 
 
 async def download_video(video_url: str, video_path: str) -> None:
     """
-    Download a video to video_path.
-      - Social media URLs  -> yt-dlp  (handles Instagram, TikTok, YouTube ...)
-      - Direct file URLs   -> httpx   (fast, lightweight for .mp4 CDN links)
-    Raises HTTPException on failure so the caller can return a proper error.
+    Smart download dispatcher:
+    1. TikTok → tikwm.com CDN URL → httpx direct download
+    2. YouTube/other social → yt-dlp
+    3. Direct .mp4 CDN links → httpx
+    Then remux all downloads to h264 for OpenCV compatibility.
     """
-    if is_social_url(video_url):
-        # yt-dlp: best mp4 up to 720p, merge to mp4 container
-        try:
-            result = subprocess.run(
-                [
-                    "yt-dlp",
-                    "--no-playlist",
-                    "--max-filesize", "80m",
-                    # Force h264 + aac for OpenCV compatibility; fall back to best
-                    "-f", (
-                        "bestvideo[vcodec^=avc][height<=720]+bestaudio[ext=m4a]"
-                        "/bestvideo[vcodec^=avc]+bestaudio[ext=m4a]"
-                        "/bestvideo[height<=720]+bestaudio"
-                        "/best"
-                    ),
-                    "--merge-output-format", "mp4",
-                    "-o", video_path,
-                    "--quiet",
-                    "--no-warnings",
-                    video_url,
-                ],
-                capture_output=True,
-                timeout=90,
-            )
-            if result.returncode != 0:
-                err = result.stderr.decode(errors="replace")[:300]
-                raise HTTPException(400, f"yt-dlp failed: {err}")
-            if not os.path.exists(video_path) or os.path.getsize(video_path) < 1000:
-                raise HTTPException(400, "yt-dlp produced no output (private/geo-blocked content?)")
-
-            # Re-mux to ensure h264 + moov-at-start so OpenCV can seek properly.
-            # This is near-instant (stream copy only, no re-encode) for h264 files.
-            # If the stream is NOT h264, we transcode with ultrafast preset.
-            remuxed = video_path + ".remux.mp4"
-            subprocess.run(
-                [
-                    FFMPEG_CMD, "-y", "-i", video_path,
-                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
-                    "-c:a", "aac", "-b:a", "128k",
-                    "-movflags", "+faststart",
-                    remuxed,
-                ],
-                capture_output=True,
-                timeout=120,
-            )
-            if os.path.exists(remuxed) and os.path.getsize(remuxed) > 1000:
-                os.replace(remuxed, video_path)
-            # If re-mux failed, proceed with original file as-is
-
-        except subprocess.TimeoutExpired:
-            raise HTTPException(408, "yt-dlp timed out (>90s)")
+    if "tiktok.com" in video_url.lower():
+        # Step 1: Try tikwm.com API to get CDN URL (bypasses IP block)
+        cdn_url = get_tiktok_cdn_url(video_url)
+        if cdn_url:
+            print(f"[download] TikTok via tikwm CDN URL")
+            await download_direct(cdn_url, video_path)
+        else:
+            # Fallback: try yt-dlp (will likely fail due to IP block, but worth trying)
+            print(f"[download] TikTok tikwm failed, trying yt-dlp fallback")
+            await download_with_ytdlp(video_url, video_path)
+    elif is_social_url(video_url):
+        print(f"[download] Social URL via yt-dlp: {video_url[:60]}")
+        await download_with_ytdlp(video_url, video_path)
     else:
-        # Direct HTTP download for CDN / direct .mp4 links
-        try:
-            async with httpx.AsyncClient(
-                timeout=30.0,
-                follow_redirects=True,
-                headers={"User-Agent": "Mozilla/5.0 (compatible; SocialGrowthBot/1.0)"},
-            ) as client:
-                r = await client.get(video_url)
-                if r.status_code != 200:
-                    raise HTTPException(400, f"Video download failed: HTTP {r.status_code}")
-                if len(r.content) > MAX_VIDEO_BYTES:
-                    raise HTTPException(400, "Video too large (>80MB)")
-                with open(video_path, "wb") as f:
-                    f.write(r.content)
-        except httpx.TimeoutException:
-            raise HTTPException(408, "Video download timed out (>30s)")
-        except httpx.RequestError as e:
-            raise HTTPException(400, f"Download error: {e}")
+        # Direct CDN / mp4 URL
+        print(f"[download] Direct URL via httpx: {video_url[:60]}")
+        await download_direct(video_url, video_path)
+
+    # Always remux to h264 for reliable OpenCV seeking
+    if os.path.exists(video_path) and os.path.getsize(video_path) > 1000:
+        await remux_to_h264(video_path)
 
 
 # -- Request / Response models -------------------------------------------------
@@ -194,7 +274,12 @@ class ProcessResponse(BaseModel):
 # -- Health check --------------------------------------------------------------
 @app.get("/health")
 def health():
-    return {"status": "ok", "model": WHISPER_MODEL_NAME}
+    return {
+        "status": "ok",
+        "model": WHISPER_MODEL_NAME,
+        "version": "3.0.0",
+        "tiktok_bypass": "tikwm.com",
+    }
 
 
 # -- Main processing endpoint --------------------------------------------------
@@ -210,7 +295,7 @@ async def process_video(req: ProcessRequest):
         # Verify video is readable by OpenCV
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
-            raise HTTPException(422, "Downloaded file is not a valid video")
+            raise HTTPException(422, "Downloaded file is not a valid video (OpenCV cannot open it)")
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         total_frames_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
         cap.release()
@@ -230,8 +315,17 @@ async def process_video(req: ProcessRequest):
                 capture_output=True,
                 timeout=60,
             )
-            audio_ok = proc.returncode == 0 and os.path.exists(audio_path) and os.path.getsize(audio_path) > 1000
-        except Exception:
+            audio_ok = (
+                proc.returncode == 0
+                and os.path.exists(audio_path)
+                and os.path.getsize(audio_path) > 1000
+            )
+            if audio_ok:
+                print(f"[audio] WAV extracted OK: {os.path.getsize(audio_path)} bytes")
+            else:
+                print(f"[audio] WAV extraction failed: rc={proc.returncode} stderr={proc.stderr.decode(errors='replace')[:200]}")
+        except Exception as e:
+            print(f"[audio] Exception during extraction: {e}")
             audio_ok = False
 
         # -- Step 3: Transcribe with faster-whisper (non-fatal) ---------------
@@ -245,15 +339,17 @@ async def process_video(req: ProcessRequest):
             try:
                 raw_segments, info = WHISPER.transcribe(
                     audio_path,
-                    beam_size=3,
-                    best_of=3,
-                    language="en",
+                    beam_size=5,
+                    best_of=5,
+                    # Don't lock to English — many social videos are multilingual
+                    language=None,
+                    task="transcribe",
                     vad_filter=True,
-                    # Looser VAD: detects singing, fast speech, music vocals
+                    # Looser VAD: catches singing, fast speech, music vocals
                     vad_parameters={
-                        "min_silence_duration_ms": 300,
-                        "speech_pad_ms": 200,
-                        "threshold": 0.3,
+                        "min_silence_duration_ms": 200,
+                        "speech_pad_ms": 400,
+                        "threshold": 0.25,
                     },
                 )
                 raw_segments = list(raw_segments)
@@ -261,13 +357,14 @@ async def process_video(req: ProcessRequest):
 
                 for seg in raw_segments:
                     text = seg.text.strip()
-                    segments_out.append(TranscriptSegment(
-                        start=round(seg.start, 2),
-                        end=round(seg.end, 2),
-                        text=text,
-                    ))
+                    if text:
+                        segments_out.append(TranscriptSegment(
+                            start=round(seg.start, 2),
+                            end=round(seg.end, 2),
+                            text=text,
+                        ))
 
-                transcript = " ".join(s.text for s in segments_out)
+                transcript = " ".join(s.text for s in segments_out).strip()
                 hook_phrase = " ".join(
                     s.text for s in segments_out if s.start < 5.0
                 ).strip()
@@ -276,15 +373,17 @@ async def process_video(req: ProcessRequest):
                 words_per_sec = len(transcript.split()) / max(duration_seconds, 1)
                 audio_energy = (
                     "high" if words_per_sec > 3.5
-                    else "medium" if words_per_sec > 1.5
+                    else "medium" if words_per_sec > 1.0
                     else "low"
                 )
 
-            except Exception:
+                print(f"[whisper] transcript={len(transcript)} chars, segments={len(segments_out)}, dur={duration_seconds:.1f}s, energy={audio_energy}")
+
+            except Exception as e:
+                print(f"[whisper] Transcription error (non-fatal): {e}")
                 transcript = ""
                 hook_phrase = ""
                 audio_energy = "unknown"
-
 
         # Use ffprobe for accurate duration if whisper didn't get it
         if duration_seconds <= 0:
@@ -306,6 +405,7 @@ async def process_video(req: ProcessRequest):
         frames, scene_count = extract_smart_frames(
             video_path, req.max_frames, duration_seconds, tmp
         )
+        print(f"[frames] extracted={len(frames)}, scenes={scene_count}, dur={duration_seconds:.1f}s")
 
         # -- Step 5: OCR on each frame ----------------------------------------
         ocr_results: list[OCRResult] = []
@@ -338,6 +438,8 @@ async def process_video(req: ProcessRequest):
                 ))
             except Exception:
                 pass
+
+        print(f"[process] DONE — frames={len(encoded_frames)} transcript={len(transcript)}chars ocr={len(ocr_results)}")
 
         return ProcessResponse(
             frames=encoded_frames,

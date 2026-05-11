@@ -80,7 +80,7 @@ async function analyzeYouTubeWithGemini(videoUrl: string) {
   });
 
   const result = await model.generateContent([
-    { fileData: { fileUri: videoUrl } },
+    { fileData: { fileUri: videoUrl, mimeType: "video/*" } },
     { text: YOUTUBE_PROMPT },
   ]);
 
@@ -212,7 +212,8 @@ export async function POST(req: NextRequest) {
       const errText = await serviceRes.text().catch(() => "unknown error");
       console.warn("[media/process] Railway error:", serviceRes.status, errText.slice(0, 200));
 
-      // Detect auth-related errors
+      // Detect auth/access errors
+      const isTikTokBlock = errText.includes("IP address is blocked") || errText.includes("[TikTok]");
       const needsAuth =
         errText.toLowerCase().includes("login") ||
         errText.toLowerCase().includes("private") ||
@@ -222,7 +223,11 @@ export async function POST(req: NextRequest) {
       return NextResponse.json(
         {
           ...FALLBACK,
-          error: needsAuth ? "instagram_auth_required" : `processing_failed: ${errText.slice(0, 150)}`,
+          error: isTikTokBlock
+            ? "tiktok_ip_blocked"
+            : needsAuth
+            ? "instagram_auth_required"
+            : `processing_failed: ${errText.slice(0, 150)}`,
         },
         { status: 200 }
       );

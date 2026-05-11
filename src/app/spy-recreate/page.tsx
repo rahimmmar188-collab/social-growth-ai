@@ -94,6 +94,7 @@ export default function SpyRecreatePage() {
   const [pipelineStage, setPipelineStage] = useState<PipelineStage>("idle");
   const [pipelineError, setPipelineError] = useState("");
   const [instagramAuthRequired, setInstagramAuthRequired] = useState(false);
+  const [tiktokBlocked, setTiktokBlocked] = useState(false);
   const [mediaSignals, setMediaSignals] = useState<{
     transcript?: string; hookPhrase?: string; ocrTexts?: {frame_index:number;text:string}[];
     durationSeconds?: number; sceneCount?: number; audioEnergy?: string;
@@ -236,6 +237,7 @@ export default function SpyRecreatePage() {
     setPipelineError("");
     setMediaSignals(null);
     setInstagramAuthRequired(false);
+    setTiktokBlocked(false);
 
     const platform = detectedPlatform || extensionPlatform || "Unknown";
     const caption   = extensionContent || pastedContent || (metadata as Record<string,string>|null)?.description || "";
@@ -254,11 +256,21 @@ export default function SpyRecreatePage() {
         });
         const pData = await pRes.json();
 
-        // Instagram requires login — surface extension guidance
+        // Instagram requires login — show guidance, STOP pipeline
         if (pData.error === "instagram_auth_required") {
           setInstagramAuthRequired(true);
-          signals = { fallback: true };
-        } else if (!pData.fallback) {
+          setPipelineStage("done");
+          return; // ← CRITICAL: do NOT run streaming with empty data
+        }
+
+        // TikTok IP block — show guidance, STOP pipeline
+        if (pData.error === "tiktok_ip_blocked") {
+          setTiktokBlocked(true);
+          setPipelineStage("done");
+          return; // ← CRITICAL: do NOT run streaming with empty data
+        }
+
+        if (!pData.fallback) {
           setPipelineStage("transcribing");
           await new Promise(r => setTimeout(r, 300));
 
@@ -294,7 +306,7 @@ export default function SpyRecreatePage() {
             durationSeconds: pData.duration_seconds,
             sceneCount:      pData.scene_count,
             audioEnergy:     pData.audio_energy,
-            visualAnalysis,
+            visualAnalysis:  visualAnalysis ?? undefined,
             fallback:        false,
           };
         } else {
@@ -308,6 +320,13 @@ export default function SpyRecreatePage() {
     }
 
     setMediaSignals(signals);
+
+    // ── Step 3: Final reasoning (streaming) ──────────────────────────────────
+    // Only run if we actually have signals (not a blocked/auth-required case)
+    if (!signals) {
+      setPipelineStage("done");
+      return;
+    }
 
     // ── Step 3: Final reasoning (streaming) ──────────────────────────────────
     setPipelineStage("reasoning");
@@ -431,8 +450,8 @@ export default function SpyRecreatePage() {
               )}
             </div>
 
-            {/* Platform warning for restricted */}
-            {url && isRestrictedPlatform(url) && !extensionContent && (
+            {/* Platform message for supported platforms (YouTube only — others require extension) */}
+            {url && url.includes("youtube.com") && !url.includes("youtu.be") === false && !extensionContent && (
               <motion.div
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}
@@ -440,15 +459,35 @@ export default function SpyRecreatePage() {
               >
                 <CheckCircle2 className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
                 <span>
-                  {detectedPlatform} video will be downloaded and analyzed directly via our media service.
-                  For even richer analysis (captions, engagement),{" "}
+                  YouTube video will be analyzed directly using Gemini AI — full transcript, scenes &amp; audio.
+                  For even richer analysis,{" "}
                   <button
                     onClick={() => setShowFallback(true)}
                     className="underline hover:text-emerald-300 transition-colors"
                   >
-                    paste the caption too
+                    paste the description too
                   </button>
-                  {" "}or use the browser extension.
+                </span>
+              </motion.div>
+            )}
+
+            {url && (url.includes("instagram.com") || url.includes("tiktok.com")) && !extensionContent && (
+              <motion.div
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                className="flex items-start gap-2 text-xs text-amber-400/80"
+              >
+                <AlertTriangle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
+                <span>
+                  {detectedPlatform} requires the browser extension for video analysis.
+                  Use the{" "}
+                  <button
+                    onClick={handleImportFromExtension}
+                    className="underline hover:text-amber-300 transition-colors"
+                  >
+                    Import from Extension
+                  </button>{" "}
+                  button above, or paste the caption manually.
                 </span>
               </motion.div>
             )}
@@ -669,6 +708,48 @@ export default function SpyRecreatePage() {
                     </a>
                     <button
                       onClick={() => { setInstagramAuthRequired(false); setShowFallback(true); }}
+                      className="text-xs text-muted-foreground hover:text-foreground transition-colors underline"
+                    >
+                      or paste the caption manually
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </GlassCard>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* ── TikTok IP Blocked Banner ── */}
+      <AnimatePresence>
+        {tiktokBlocked && (
+          <motion.div
+            initial={{ opacity: 0, y: 8 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0 }}
+          >
+            <GlassCard hover={false}>
+              <div className="flex items-start gap-4">
+                <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-cyan-500/20 to-blue-500/20 flex items-center justify-center flex-shrink-0">
+                  <span className="text-xl">🎵</span>
+                </div>
+                <div className="flex-1 space-y-2">
+                  <p className="text-sm font-semibold text-foreground">TikTok requires the browser extension</p>
+                  <p className="text-xs text-muted-foreground leading-relaxed">
+                    TikTok is blocking our server&apos;s IP from downloading this video. To analyze TikTok videos,
+                    open the video in your browser, then click the{" "}
+                    <strong className="text-violet-400">Smart Import</strong> extension button — it
+                    extracts the real video, audio, and caption directly from your authenticated session.
+                  </p>
+                  <div className="flex items-center gap-2 pt-1">
+                    <a
+                      href="/extension"
+                      className="inline-flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg gradient-violet text-white font-medium hover:opacity-90 transition-opacity"
+                    >
+                      <Download className="w-3 h-3" /> Get the Extension
+                    </a>
+                    <button
+                      onClick={() => { setTiktokBlocked(false); setShowFallback(true); }}
                       className="text-xs text-muted-foreground hover:text-foreground transition-colors underline"
                     >
                       or paste the caption manually
