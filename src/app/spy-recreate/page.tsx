@@ -29,6 +29,7 @@ import {
   ClipboardPaste,
   ChevronRight,
   AlertTriangle,
+  Download,
 } from "lucide-react";
 
 function detectPlatform(url: string): string {
@@ -92,6 +93,7 @@ export default function SpyRecreatePage() {
   ];
   const [pipelineStage, setPipelineStage] = useState<PipelineStage>("idle");
   const [pipelineError, setPipelineError] = useState("");
+  const [instagramAuthRequired, setInstagramAuthRequired] = useState(false);
   const [mediaSignals, setMediaSignals] = useState<{
     transcript?: string; hookPhrase?: string; ocrTexts?: {frame_index:number;text:string}[];
     durationSeconds?: number; sceneCount?: number; audioEnergy?: string;
@@ -233,6 +235,7 @@ export default function SpyRecreatePage() {
     reset();
     setPipelineError("");
     setMediaSignals(null);
+    setInstagramAuthRequired(false);
 
     const platform = detectedPlatform || extensionPlatform || "Unknown";
     const caption   = extensionContent || pastedContent || (metadata as Record<string,string>|null)?.description || "";
@@ -240,7 +243,7 @@ export default function SpyRecreatePage() {
 
     let signals: typeof mediaSignals = null;
 
-    // ── Step 1: Process video (FFmpeg + Whisper + OCR) ───────────────────────
+    // ── Step 1: Process video via media service ───────────────────────────────
     if (videoUrl) {
       try {
         setPipelineStage("downloading");
@@ -251,29 +254,37 @@ export default function SpyRecreatePage() {
         });
         const pData = await pRes.json();
 
-        if (!pData.fallback) {
+        // Instagram requires login — surface extension guidance
+        if (pData.error === "instagram_auth_required") {
+          setInstagramAuthRequired(true);
+          signals = { fallback: true };
+        } else if (!pData.fallback) {
           setPipelineStage("transcribing");
-          await new Promise(r => setTimeout(r, 400)); // visual pause
+          await new Promise(r => setTimeout(r, 300));
 
           setPipelineStage("extracting_text");
-          await new Promise(r => setTimeout(r, 400));
+          await new Promise(r => setTimeout(r, 300));
 
-          // ── Step 2: Vision analysis ────────────────────────────────────────
           setPipelineStage("analyzing_vision");
-          let visualAnalysis = null;
-          if (pData.frames?.length > 0) {
+
+          // Gemini-native responses already include visual_analysis embedded.
+          // Only call /api/media/vision for Railway responses (raw frames).
+          let visualAnalysis: Record<string,unknown> | null =
+            pData.visual_analysis || null;
+
+          if (!visualAnalysis && pData.frames?.length > 0) {
             try {
               const vRes = await fetch("/api/media/vision", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
-                  frames:    pData.frames,
+                  frames:     pData.frames,
                   transcript: pData.transcript,
-                  ocrTexts:  pData.ocr_texts,
+                  ocrTexts:   pData.ocr_texts,
                 }),
               });
               visualAnalysis = await vRes.json();
-            } catch { /* vision non-fatal */ }
+            } catch { /* vision is non-fatal */ }
           }
 
           signals = {
@@ -627,6 +638,48 @@ export default function SpyRecreatePage() {
           </div>
         </div>
       </GlassCard>
+
+      {/* ── Instagram Auth Required Banner ── */}
+      <AnimatePresence>
+        {instagramAuthRequired && (
+          <motion.div
+            initial={{ opacity: 0, y: 8 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0 }}
+          >
+            <GlassCard hover={false}>
+              <div className="flex items-start gap-4">
+                <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-pink-500/20 to-purple-500/20 flex items-center justify-center flex-shrink-0">
+                  <span className="text-xl">📲</span>
+                </div>
+                <div className="flex-1 space-y-2">
+                  <p className="text-sm font-semibold text-foreground">Instagram requires the browser extension</p>
+                  <p className="text-xs text-muted-foreground leading-relaxed">
+                    Instagram blocks direct video downloads from servers. To analyze Instagram Reels, open the post
+                    in your browser where you&apos;re already logged in, then click the{" "}
+                    <strong className="text-violet-400">Smart Import</strong> extension button — it runs in
+                    your authenticated session and extracts the real video + caption instantly.
+                  </p>
+                  <div className="flex items-center gap-2 pt-1">
+                    <a
+                      href="/extension"
+                      className="inline-flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg gradient-violet text-white font-medium hover:opacity-90 transition-opacity"
+                    >
+                      <Download className="w-3 h-3" /> Get the Extension
+                    </a>
+                    <button
+                      onClick={() => { setInstagramAuthRequired(false); setShowFallback(true); }}
+                      className="text-xs text-muted-foreground hover:text-foreground transition-colors underline"
+                    >
+                      or paste the caption manually
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </GlassCard>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* ── Animated Pipeline Stages ── */}
       {(isStreaming || (pipelineStage !== "idle" && pipelineStage !== "done" && pipelineStage !== "error")) && (
