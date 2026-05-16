@@ -12,7 +12,7 @@
     "src/app/api/agents/trend/route.ts": { "maxDuration": 60 },
     "src/app/api/agents/url/route.ts": { "maxDuration": 60 },
     "src/app/api/competitors/posts/route.ts":           { "maxDuration": 60 },
-    "src/app/api/media/process/route.ts":                { "maxDuration": 60 },
+    "src/app/api/media/process/route.ts":                { "maxDuration": 300 },
     "src/app/api/media/vision/route.ts":                 { "maxDuration": 60 },
     "src/app/api/agents/multimodal-url/route.ts":        { "maxDuration": 60 }
   }

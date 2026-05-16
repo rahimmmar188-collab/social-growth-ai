@@ -1,18 +1,17 @@
 """
-Social Growth AI - Media Processing Service
-FastAPI microservice: FFmpeg frame extraction + faster-whisper + pytesseract OCR
-Deployed on Railway. Called by Next.js on Vercel.
+Social Growth AI - Media Processing Service v3.0
+FastAPI microservice: yt-dlp download + FFmpeg audio + faster-whisper transcription
++ PySceneDetect frame extraction + pytesseract OCR
 """
 
 from __future__ import annotations
 
 import base64
-import json
+import logging
 import os
 import subprocess
+import sys
 import tempfile
-import urllib.parse
-import urllib.request
 from typing import Optional
 
 import cv2
@@ -27,6 +26,14 @@ from pydantic import BaseModel
 from scenedetect import SceneManager, open_video
 from scenedetect.detectors import ContentDetector
 
+# -- Logging setup -------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("media-service")
+
 # -- App setup -----------------------------------------------------------------
 app = FastAPI(title="Social Growth AI - Media Service", version="3.0.0")
 
@@ -39,198 +46,164 @@ app.add_middleware(
 
 # -- Whisper model (loaded once at startup, stays in memory) -------------------
 WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL", "base.en")
-print(f"Loading Whisper model: {WHISPER_MODEL_NAME} ...")
-WHISPER = WhisperModel(WHISPER_MODEL_NAME, device="cpu", compute_type="int8")
-print("Whisper ready.")
+log.info(f"Loading Whisper model: {WHISPER_MODEL_NAME} ...")
+try:
+    WHISPER = WhisperModel(WHISPER_MODEL_NAME, device="cpu", compute_type="int8")
+    log.info("Whisper ready.")
+except Exception as e:
+    log.error(f"Whisper failed to load: {e}")
+    WHISPER = None
 
-# -- Path configuration -------------------------------------------------------
-# Windows-specific winget FFmpeg paths (no-op on Linux/Docker)
-_FFMPEG_WINGET = (
-    r"C:\Users\Rahim M\AppData\Local\Microsoft\WinGet\Packages"
-    r"\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe"
-    r"\ffmpeg-8.1.1-full_build\bin\ffmpeg.exe"
-)
-_FFPROBE_WINGET = _FFMPEG_WINGET.replace("ffmpeg.exe", "ffprobe.exe")
+# -- Path configuration --------------------------------------------------------
+def _find_cmd(candidates: list[str], env_var: str) -> str:
+    """Pick first existing path from candidates, or fall back to env/PATH."""
+    env_override = os.getenv(env_var)
+    if env_override and os.path.exists(env_override):
+        return env_override
+    for p in candidates:
+        if os.path.exists(p):
+            log.info(f"{env_var} found at: {p}")
+            return p
+    # Fall back to PATH name (works in Linux/Docker)
+    cmd = candidates[-1]  # last entry is just the command name
+    log.warning(f"{env_var} not found in known paths, falling back to: {cmd}")
+    return cmd
 
-FFMPEG_CMD  = os.getenv("FFMPEG_PATH",  _FFMPEG_WINGET if os.path.exists(_FFMPEG_WINGET)  else "ffmpeg")
-FFPROBE_CMD = os.getenv("FFPROBE_PATH", _FFPROBE_WINGET if os.path.exists(_FFPROBE_WINGET) else "ffprobe")
+FFMPEG_CMD = _find_cmd([
+    r"C:\Users\Rahim M\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.1.1-full_build\bin\ffmpeg.exe",
+    r"C:\ffmpeg\bin\ffmpeg.exe",
+    r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
+    "ffmpeg",  # Linux/Docker fallback
+], "FFMPEG_PATH")
 
-# Tesseract
-_TESS_WIN = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-pytesseract.pytesseract.tesseract_cmd = os.getenv(
-    "TESSERACT_PATH",
-    _TESS_WIN if os.path.exists(_TESS_WIN) else "tesseract"
-)
+FFPROBE_CMD = _find_cmd([
+    r"C:\Users\Rahim M\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.1.1-full_build\bin\ffprobe.exe",
+    r"C:\ffmpeg\bin\ffprobe.exe",
+    r"C:\Program Files\ffmpeg\bin\ffprobe.exe",
+    "ffprobe",
+], "FFPROBE_PATH")
 
-MAX_VIDEO_BYTES = 100 * 1024 * 1024  # 100 MB hard cap
+TESSERACT_CMD = _find_cmd([
+    r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+    r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+    r"C:\Users\Rahim M\AppData\Local\Programs\Tesseract-OCR\tesseract.exe",
+    "tesseract",
+], "TESSERACT_PATH")
 
-# -- Social media domains that may need yt-dlp --------------------------------
+pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
+
+# -- Python executable (use Python 3.12 explicitly on Windows) -----------------
+PYTHON_312 = r"C:\Users\Rahim M\AppData\Local\Programs\Python\Python312\python.exe"
+PYTHON_EXE = PYTHON_312 if os.path.exists(PYTHON_312) else sys.executable
+log.info(f"Python for yt-dlp: {PYTHON_EXE}")
+log.info(f"FFmpeg: {FFMPEG_CMD}")
+log.info(f"Tesseract: {TESSERACT_CMD}")
+
+MAX_VIDEO_BYTES = 100 * 1024 * 1024  # 100 MB
+
+# -- Social media domains that require yt-dlp ---------------------------------
 SOCIAL_DOMAINS = (
-    "youtube.com", "youtu.be",
+    "instagram.com", "tiktok.com", "youtube.com", "youtu.be",
     "facebook.com", "fb.com", "twitter.com", "x.com",
     "threads.net", "snapchat.com", "pinterest.com", "reddit.com",
+    "linkedin.com",
 )
-
-# -- TikTok CDN extraction via tikwm.com public API ---------------------------
-def get_tiktok_cdn_url(tiktok_url: str) -> str | None:
-    """
-    Use the tikwm.com public API to extract the TikTok video CDN URL.
-    This BYPASSES TikTok's IP block on Railway since we hit tikwm's servers,
-    not TikTok directly. Returns the direct mp4 CDN URL or None on failure.
-    """
-    try:
-        encoded = urllib.parse.quote(tiktok_url, safe="")
-        api_url = f"https://www.tikwm.com/api/?url={encoded}&hd=1"
-        req = urllib.request.Request(
-            api_url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Referer": "https://www.tikwm.com/",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            data = json.loads(resp.read().decode())
-        if data.get("code") == 0:
-            video_data = data.get("data", {})
-            # Prefer HD, fall back to standard quality
-            cdn = video_data.get("hdplay") or video_data.get("play") or ""
-            if cdn and cdn.startswith("http"):
-                print(f"[tikwm] CDN URL obtained: {cdn[:80]}...")
-                return cdn
-    except Exception as e:
-        print(f"[tikwm] Failed to get CDN URL: {e}")
-    return None
 
 
 def is_social_url(url: str) -> bool:
-    """True if the URL is a social media page requiring yt-dlp (not TikTok/Instagram)."""
-    if ".mp4" in url.lower():
-        return False
-    # TikTok handled separately via tikwm
-    if "tiktok.com" in url.lower():
-        return False
-    # Instagram handled via extension — Railway IP is blocked
-    if "instagram.com" in url.lower():
+    if ".mp4" in url.lower() and "http" in url.lower():
         return False
     return any(d in url.lower() for d in SOCIAL_DOMAINS)
 
 
-async def download_direct(video_url: str, video_path: str) -> None:
-    """Download a direct mp4/CDN URL using httpx (streaming to handle large files)."""
-    try:
-        async with httpx.AsyncClient(
-            timeout=60.0,
-            follow_redirects=True,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Referer": "https://www.tiktok.com/",
-            },
-        ) as client:
-            async with client.stream("GET", video_url) as r:
-                if r.status_code != 200:
-                    raise HTTPException(400, f"CDN download failed: HTTP {r.status_code}")
-                total = 0
-                with open(video_path, "wb") as f:
-                    async for chunk in r.aiter_bytes(chunk_size=65536):
-                        total += len(chunk)
-                        if total > MAX_VIDEO_BYTES:
-                            raise HTTPException(400, "Video too large (>100MB)")
-                        f.write(chunk)
-        if not os.path.exists(video_path) or os.path.getsize(video_path) < 1000:
-            raise HTTPException(400, "Downloaded file is empty")
-    except httpx.TimeoutException:
-        raise HTTPException(408, "Video download timed out (>60s)")
-    except httpx.RequestError as e:
-        raise HTTPException(400, f"Download error: {e}")
-
-
-async def download_with_ytdlp(video_url: str, video_path: str) -> None:
-    """Download via yt-dlp for YouTube and other supported platforms."""
-    try:
-        result = subprocess.run(
-            [
-                "yt-dlp",
-                "--no-playlist",
-                "--max-filesize", "100m",
-                # Force h264 + aac for OpenCV compatibility; fall back to best
-                "-f", (
-                    "bestvideo[vcodec^=avc][height<=720]+bestaudio[ext=m4a]"
-                    "/bestvideo[vcodec^=avc]+bestaudio[ext=m4a]"
-                    "/bestvideo[height<=720]+bestaudio"
-                    "/best"
-                ),
-                "--merge-output-format", "mp4",
-                "-o", video_path,
-                "--quiet",
-                "--no-warnings",
-                video_url,
-            ],
-            capture_output=True,
-            timeout=120,
-        )
-        if result.returncode != 0:
-            err = result.stderr.decode(errors="replace")[:400]
-            raise HTTPException(400, f"yt-dlp failed: {err}")
-        if not os.path.exists(video_path) or os.path.getsize(video_path) < 1000:
-            raise HTTPException(400, "yt-dlp produced no output (private/geo-blocked content?)")
-    except subprocess.TimeoutExpired:
-        raise HTTPException(408, "yt-dlp timed out (>120s)")
-
-
-async def remux_to_h264(video_path: str) -> None:
-    """
-    Re-mux to h264 mp4 with moov-at-start so OpenCV can seek properly.
-    Near-instant for h264 files (stream copy). Transcodes other codecs.
-    Non-fatal: if remux fails, proceed with original.
-    """
-    remuxed = video_path + ".remux.mp4"
-    try:
-        subprocess.run(
-            [
-                FFMPEG_CMD, "-y", "-i", video_path,
-                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
-                "-c:a", "aac", "-b:a", "128k",
-                "-movflags", "+faststart",
-                remuxed,
-            ],
-            capture_output=True,
-            timeout=120,
-        )
-        if os.path.exists(remuxed) and os.path.getsize(remuxed) > 1000:
-            os.replace(remuxed, video_path)
-    except Exception as e:
-        print(f"[remux] Non-fatal remux error: {e}")
-
-
+# -- Download video ------------------------------------------------------------
 async def download_video(video_url: str, video_path: str) -> None:
     """
-    Smart download dispatcher:
-    1. TikTok → tikwm.com CDN URL → httpx direct download
-    2. YouTube/other social → yt-dlp
-    3. Direct .mp4 CDN links → httpx
-    Then remux all downloads to h264 for OpenCV compatibility.
+    Download video to video_path.
+    Social URLs → yt-dlp; Direct .mp4 → httpx streaming download.
+    Raises HTTPException on failure.
     """
-    if "tiktok.com" in video_url.lower():
-        # Step 1: Try tikwm.com API to get CDN URL (bypasses IP block)
-        cdn_url = get_tiktok_cdn_url(video_url)
-        if cdn_url:
-            print(f"[download] TikTok via tikwm CDN URL")
-            await download_direct(cdn_url, video_path)
-        else:
-            # Fallback: try yt-dlp (will likely fail due to IP block, but worth trying)
-            print(f"[download] TikTok tikwm failed, trying yt-dlp fallback")
-            await download_with_ytdlp(video_url, video_path)
-    elif is_social_url(video_url):
-        print(f"[download] Social URL via yt-dlp: {video_url[:60]}")
-        await download_with_ytdlp(video_url, video_path)
-    else:
-        # Direct CDN / mp4 URL
-        print(f"[download] Direct URL via httpx: {video_url[:60]}")
-        await download_direct(video_url, video_path)
+    if is_social_url(video_url):
+        log.info(f"yt-dlp download: {video_url[:80]}")
+        try:
+            result = subprocess.run(
+                [
+                    PYTHON_EXE, "-m", "yt_dlp",
+                    "--no-playlist",
+                    "--max-filesize", "100m",
+                    "-f", (
+                        "bestvideo[vcodec^=avc][height<=720]+bestaudio[ext=m4a]"
+                        "/bestvideo[vcodec^=avc]+bestaudio[ext=m4a]"
+                        "/bestvideo[height<=720]+bestaudio"
+                        "/best[height<=720]"
+                        "/best"
+                    ),
+                    "--merge-output-format", "mp4",
+                    "-o", video_path,
+                    "--no-warnings",
+                    video_url,
+                ],
+                capture_output=True,
+                timeout=120,
+            )
+            stdout = result.stdout.decode(errors="replace")
+            stderr = result.stderr.decode(errors="replace")
 
-    # Always remux to h264 for reliable OpenCV seeking
-    if os.path.exists(video_path) and os.path.getsize(video_path) > 1000:
-        await remux_to_h264(video_path)
+            if result.returncode != 0:
+                log.error(f"yt-dlp failed (code {result.returncode}): {stderr[:400]}")
+                raise HTTPException(400, f"yt-dlp failed: {stderr[:300]}")
+
+            if not os.path.exists(video_path) or os.path.getsize(video_path) < 1000:
+                log.error(f"yt-dlp produced no output. stderr: {stderr[:200]}")
+                raise HTTPException(400, "yt-dlp produced no output (private/geo-blocked?)")
+
+            log.info(f"yt-dlp OK — {os.path.getsize(video_path) // 1024} KB")
+
+            # Re-mux for OpenCV compatibility (faststart + h264)
+            remuxed = video_path + ".remux.mp4"
+            rr = subprocess.run(
+                [
+                    FFMPEG_CMD, "-y", "-i", video_path,
+                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                    "-c:a", "aac", "-b:a", "128k",
+                    "-movflags", "+faststart",
+                    remuxed,
+                ],
+                capture_output=True,
+                timeout=180,
+            )
+            if rr.returncode == 0 and os.path.exists(remuxed) and os.path.getsize(remuxed) > 1000:
+                os.replace(remuxed, video_path)
+                log.info("Re-mux OK")
+            else:
+                log.warning(f"Re-mux failed (code {rr.returncode}), using original file")
+
+        except subprocess.TimeoutExpired:
+            raise HTTPException(408, "yt-dlp timed out (>120s)")
+
+    else:
+        log.info(f"HTTP download: {video_url[:80]}")
+        try:
+            async with httpx.AsyncClient(
+                timeout=60.0,
+                follow_redirects=True,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; SocialGrowthBot/2.0)"},
+            ) as client:
+                async with client.stream("GET", video_url) as r:
+                    if r.status_code != 200:
+                        raise HTTPException(400, f"Download failed: HTTP {r.status_code}")
+                    total = 0
+                    with open(video_path, "wb") as f:
+                        async for chunk in r.aiter_bytes(chunk_size=65536):
+                            total += len(chunk)
+                            if total > MAX_VIDEO_BYTES:
+                                raise HTTPException(400, "Video too large (>100MB)")
+                            f.write(chunk)
+            log.info(f"HTTP download OK — {total // 1024} KB")
+        except httpx.TimeoutException:
+            raise HTTPException(408, "Video download timed out (>60s)")
+        except httpx.RequestError as e:
+            raise HTTPException(400, f"Download error: {e}")
 
 
 # -- Request / Response models -------------------------------------------------
@@ -277,80 +250,82 @@ def health():
     return {
         "status": "ok",
         "model": WHISPER_MODEL_NAME,
-        "version": "3.0.0",
-        "tiktok_bypass": "tikwm.com",
+        "whisper": WHISPER is not None,
+        "ffmpeg": os.path.exists(FFMPEG_CMD) or FFMPEG_CMD == "ffmpeg",
+        "tesseract": os.path.exists(TESSERACT_CMD) or TESSERACT_CMD == "tesseract",
     }
 
 
 # -- Main processing endpoint --------------------------------------------------
 @app.post("/process", response_model=ProcessResponse)
 async def process_video(req: ProcessRequest):
+    log.info(f"=== START process_video: {req.video_url[:80]} ===")
+
     with tempfile.TemporaryDirectory() as tmp:
         video_path = os.path.join(tmp, "input.mp4")
         audio_path = os.path.join(tmp, "audio.wav")
 
-        # -- Step 1: Download video -------------------------------------------
+        # ── Step 1: Download ──────────────────────────────────────────────────
+        log.info("Step 1: Downloading video...")
         await download_video(req.video_url, video_path)
+        log.info(f"Step 1 DONE — file size: {os.path.getsize(video_path) // 1024} KB")
 
-        # Verify video is readable by OpenCV
+        # ── Verify OpenCV can read the file ───────────────────────────────────
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
-            raise HTTPException(422, "Downloaded file is not a valid video (OpenCV cannot open it)")
+            log.error("OpenCV cannot open the downloaded file")
+            raise HTTPException(422, "Downloaded file is not a valid video (OpenCV cannot read it)")
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        total_frames_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        total_frames_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         cap.release()
+        log.info(f"OpenCV OK — fps={fps:.1f} total_frames={total_frames_count}")
 
-        # -- Step 2: Extract audio -> WAV (non-fatal if it fails) ------------
+        # ── Step 2: Extract audio ─────────────────────────────────────────────
+        log.info("Step 2: Extracting audio with FFmpeg...")
         audio_ok = False
         try:
             proc = subprocess.run(
                 [
                     FFMPEG_CMD, "-y", "-i", video_path,
-                    "-vn",           # no video stream
-                    "-ar", "16000",  # 16kHz - optimal for Whisper
-                    "-ac", "1",      # mono
+                    "-vn",
+                    "-ar", "16000",
+                    "-ac", "1",
                     "-c:a", "pcm_s16le",
                     audio_path,
                 ],
                 capture_output=True,
-                timeout=60,
+                timeout=120,
             )
-            audio_ok = (
-                proc.returncode == 0
-                and os.path.exists(audio_path)
-                and os.path.getsize(audio_path) > 1000
-            )
-            if audio_ok:
-                print(f"[audio] WAV extracted OK: {os.path.getsize(audio_path)} bytes")
+            if proc.returncode == 0 and os.path.exists(audio_path) and os.path.getsize(audio_path) > 1000:
+                audio_ok = True
+                log.info(f"Step 2 DONE — audio: {os.path.getsize(audio_path) // 1024} KB")
             else:
-                print(f"[audio] WAV extraction failed: rc={proc.returncode} stderr={proc.stderr.decode(errors='replace')[:200]}")
+                log.warning(f"FFmpeg audio extraction failed (code {proc.returncode}): {proc.stderr.decode(errors='replace')[:200]}")
+        except subprocess.TimeoutExpired:
+            log.error("FFmpeg audio extraction timed out")
         except Exception as e:
-            print(f"[audio] Exception during extraction: {e}")
-            audio_ok = False
+            log.error(f"FFmpeg audio extraction error: {e}")
 
-        # -- Step 3: Transcribe with faster-whisper (non-fatal) ---------------
+        # ── Step 3: Transcribe with Whisper ───────────────────────────────────
         transcript = ""
         hook_phrase = ""
         segments_out: list[TranscriptSegment] = []
         duration_seconds = 0.0
         audio_energy = "unknown"
 
-        if audio_ok:
+        if audio_ok and WHISPER is not None:
+            log.info("Step 3: Transcribing with Whisper...")
             try:
+                # First attempt: WITHOUT VAD filter (VAD is too aggressive for music/singing)
                 raw_segments, info = WHISPER.transcribe(
                     audio_path,
                     beam_size=5,
                     best_of=5,
-                    # Don't lock to English — many social videos are multilingual
-                    language=None,
-                    task="transcribe",
-                    vad_filter=True,
-                    # Looser VAD: catches singing, fast speech, music vocals
-                    vad_parameters={
-                        "min_silence_duration_ms": 200,
-                        "speech_pad_ms": 400,
-                        "threshold": 0.25,
-                    },
+                    language=None,           # auto-detect language
+                    vad_filter=False,        # DISABLED: VAD removes music/singing entirely
+                    no_speech_threshold=0.6, # only skip truly silent segments
+                    condition_on_previous_text=True,
+                    temperature=0.0,
                 )
                 raw_segments = list(raw_segments)
                 duration_seconds = float(info.duration)
@@ -364,52 +339,54 @@ async def process_video(req: ProcessRequest):
                             text=text,
                         ))
 
-                transcript = " ".join(s.text for s in segments_out).strip()
+                transcript = " ".join(s.text for s in segments_out)
                 hook_phrase = " ".join(
                     s.text for s in segments_out if s.start < 5.0
                 ).strip()
 
-                # Simple energy estimate from word density
                 words_per_sec = len(transcript.split()) / max(duration_seconds, 1)
                 audio_energy = (
                     "high" if words_per_sec > 3.5
-                    else "medium" if words_per_sec > 1.0
+                    else "medium" if words_per_sec > 1.5
                     else "low"
                 )
-
-                print(f"[whisper] transcript={len(transcript)} chars, segments={len(segments_out)}, dur={duration_seconds:.1f}s, energy={audio_energy}")
-
+                log.info(f"Step 3 DONE — {len(segments_out)} segments, dur={duration_seconds:.1f}s, energy={audio_energy}")
+                log.info(f"Transcript (first 150 chars): {transcript[:150]}")
             except Exception as e:
-                print(f"[whisper] Transcription error (non-fatal): {e}")
-                transcript = ""
-                hook_phrase = ""
-                audio_energy = "unknown"
+                log.error(f"Whisper transcription failed: {e}", exc_info=True)
+        elif not audio_ok:
+            log.warning("Step 3: SKIPPED — audio extraction failed")
+        else:
+            log.warning("Step 3: SKIPPED — Whisper model not loaded")
 
-        # Use ffprobe for accurate duration if whisper didn't get it
+        # ── Get duration via ffprobe if Whisper didn't give it ────────────────
         if duration_seconds <= 0:
             try:
-                result = subprocess.run(
-                    [
-                        FFPROBE_CMD, "-v", "error",
-                        "-show_entries", "format=duration",
-                        "-of", "default=noprint_wrappers=1:nokey=1",
-                        video_path,
-                    ],
-                    capture_output=True, text=True, timeout=10,
+                r = subprocess.run(
+                    [FFPROBE_CMD, "-v", "error",
+                     "-show_entries", "format=duration",
+                     "-of", "default=noprint_wrappers=1:nokey=1",
+                     video_path],
+                    capture_output=True, text=True, timeout=15,
                 )
-                duration_seconds = float(result.stdout.strip() or "0")
-            except Exception:
+                duration_seconds = float(r.stdout.strip() or "0")
+                log.info(f"ffprobe duration: {duration_seconds:.1f}s")
+            except Exception as e:
                 duration_seconds = total_frames_count / fps if fps > 0 else 30.0
+                log.warning(f"ffprobe failed ({e}), estimated duration: {duration_seconds:.1f}s")
 
-        # -- Step 4: Intelligent frame extraction -----------------------------
+        # ── Step 4: Smart frame extraction ────────────────────────────────────
+        log.info("Step 4: Extracting frames...")
         frames, scene_count = extract_smart_frames(
             video_path, req.max_frames, duration_seconds, tmp
         )
-        print(f"[frames] extracted={len(frames)}, scenes={scene_count}, dur={duration_seconds:.1f}s")
+        log.info(f"Step 4 DONE — {len(frames)} frames, {scene_count} scenes")
 
-        # -- Step 5: OCR on each frame ----------------------------------------
+        # ── Step 5: OCR on each frame ─────────────────────────────────────────
+        log.info("Step 5: Running OCR on frames...")
         ocr_results: list[OCRResult] = []
         seen_ocr: set[str] = set()
+        ocr_errors = 0
 
         for frame_data in frames:
             try:
@@ -421,10 +398,14 @@ async def process_video(req: ProcessRequest):
                         frame_index=frame_data["index"],
                         text=text,
                     ))
-            except Exception:
-                pass
+            except Exception as e:
+                ocr_errors += 1
+                log.warning(f"OCR error on frame {frame_data['index']}: {e}")
 
-        # -- Step 6: Encode frames as base64 ----------------------------------
+        log.info(f"Step 5 DONE — {len(ocr_results)} unique OCR results, {ocr_errors} errors")
+
+        # ── Step 6: Encode frames as base64 ───────────────────────────────────
+        log.info("Step 6: Encoding frames as base64...")
         encoded_frames: list[FrameResult] = []
         for frame_data in frames:
             try:
@@ -436,10 +417,11 @@ async def process_video(req: ProcessRequest):
                     scene_index=frame_data["scene_index"],
                     base64=b64,
                 ))
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning(f"Frame encode error: {e}")
 
-        print(f"[process] DONE — frames={len(encoded_frames)} transcript={len(transcript)}chars ocr={len(ocr_results)}")
+        log.info(f"Step 6 DONE — {len(encoded_frames)} frames encoded")
+        log.info(f"=== COMPLETE: transcript={len(transcript)}chars frames={len(encoded_frames)} scenes={scene_count} dur={duration_seconds:.1f}s ===")
 
         return ProcessResponse(
             frames=encoded_frames,
@@ -454,46 +436,38 @@ async def process_video(req: ProcessRequest):
         )
 
 
-# -- Intelligent frame extraction ----------------------------------------------
+# -- Intelligent frame extraction ---------------------------------------------
 def extract_smart_frames(
     video_path: str,
     max_frames: int,
     duration: float,
     tmp_dir: str,
 ) -> tuple[list[dict], int]:
-    """
-    Sampling strategy:
-    1. Hook zone   - first 3 seconds, 1 frame every ~1s
-    2. Scene transitions - via PySceneDetect ContentDetector
-    3. CTA zone    - last 3 seconds, 1 frame every ~1s
-    Total capped at max_frames. Each frame saved as 720p JPEG (75% quality).
-    """
     frames: list[dict] = []
     seen_ms: set[int] = set()
     scene_count = 0
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
+        log.error("extract_smart_frames: OpenCV cannot open video")
         return frames, 0
 
     def save_frame_at(ts: float, scene_idx: int) -> bool:
         ms = int(ts * 1000)
-        if ms in seen_ms or ts < 0 or ts > duration:
+        if ms in seen_ms or ts < 0 or ts > duration + 1:
             return False
         seen_ms.add(ms)
         cap.set(cv2.CAP_PROP_POS_MSEC, ms)
         ret, frame = cap.read()
         if not ret or frame is None:
+            log.debug(f"Frame read failed at {ts:.2f}s")
             return False
-        # Downscale to max 1280px wide for smaller base64 payload
         h, w = frame.shape[:2]
         if w > 1280:
             scale = 1280.0 / w
-            frame = cv2.resize(
-                frame, (1280, int(h * scale)), interpolation=cv2.INTER_AREA
-            )
+            frame = cv2.resize(frame, (1280, int(h * scale)), interpolation=cv2.INTER_AREA)
         path = os.path.join(tmp_dir, f"frame_{len(frames):04d}.jpg")
-        cv2.imwrite(path, frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+        cv2.imwrite(path, frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
         frames.append({
             "path": path,
             "timestamp": ts,
@@ -502,7 +476,7 @@ def extract_smart_frames(
         })
         return True
 
-    # Hook zone: first 3 seconds (dense)
+    # Hook zone: first 3 seconds
     for ts in [0.3, 1.0, 2.0, 3.0]:
         if ts < duration:
             save_frame_at(ts, 0)
@@ -515,55 +489,54 @@ def extract_smart_frames(
         sm.detect_scenes(video, show_progress=False)
         scene_list = sm.get_scene_list()
         scene_count = len(scene_list)
+        log.info(f"PySceneDetect found {scene_count} scenes")
 
         for i, (start, _) in enumerate(scene_list):
-            ts = start.get_seconds() + 0.5  # 0.5s after cut for stable frame
+            ts = start.get_seconds() + 0.5
             if 3.5 < ts < duration - 3.0 and len(frames) < max_frames - 3:
                 save_frame_at(ts, i + 1)
-    except Exception:
-        scene_count = 0  # non-fatal
+    except Exception as e:
+        log.warning(f"PySceneDetect failed (non-fatal): {e}")
+        scene_count = 0
 
-    # CTA zone: last 3 seconds (dense)
+    # Midpoint sample if we don't have enough frames
+    if len(frames) < 4 and duration > 6:
+        for ts in [duration * 0.25, duration * 0.5, duration * 0.75]:
+            if len(frames) < max_frames:
+                save_frame_at(ts, 50)
+
+    # CTA zone: last 3 seconds
     for ts in [duration - 2.5, duration - 1.5, duration - 0.5]:
         if ts > 3.5 and len(frames) < max_frames:
             save_frame_at(ts, 99)
 
     cap.release()
+    log.info(f"Frame extraction: {len(frames)} frames captured")
     return frames[:max_frames], scene_count
 
 
 # -- OCR helper ----------------------------------------------------------------
 def run_ocr(img: Image.Image) -> str:
-    """
-    Pre-processes frame for better OCR accuracy:
-    1. Convert to grayscale
-    2. Increase contrast
-    3. Slight sharpening
-    Then runs Tesseract with page-segmentation mode 6 (uniform block of text).
-    """
     try:
-        # Resize to at least 1000px wide for OCR accuracy
         w, h = img.size
         if w < 1000:
             img = img.resize((1000, int(h * 1000 / w)), Image.LANCZOS)
 
         gray = img.convert("L")
-        # Boost contrast
         enhancer = ImageEnhance.Contrast(gray)
         gray = enhancer.enhance(2.0)
-        # Sharpen
         gray = gray.filter(ImageFilter.SHARPEN)
 
         text = pytesseract.image_to_string(
             gray,
-            config='--psm 6 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 !?.,@#$%&*()-+:;\'"',
+            config="--psm 6 --oem 3",
         ).strip()
 
-        # Filter noise: must have at least 1 meaningful word (>2 chars)
         meaningful = [w for w in text.split() if len(w) > 2]
         if len(meaningful) < 1:
             return ""
 
         return " ".join(meaningful)
-    except Exception:
+    except Exception as e:
+        log.debug(f"OCR error: {e}")
         return ""

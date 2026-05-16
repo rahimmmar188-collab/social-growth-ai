@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
 export const runtime = "nodejs";
-export const maxDuration = 120;
+export const maxDuration = 300; // 5 min — needed for Gemini video analysis
 
 const MEDIA_SERVICE_URL =
   process.env.MEDIA_SERVICE_URL || "http://127.0.0.1:8000";
@@ -20,109 +20,117 @@ const FALLBACK = {
   audio_energy: "unknown",
 };
 
-// ── Gemini native YouTube analysis prompt ─────────────────────────────────────
-const YOUTUBE_PROMPT = `You are an expert social media video analyst. Watch this entire video now.
-
-Extract and return ALL of the following as a single valid JSON object:
-{
-  "transcript": "Complete verbatim transcript of ALL spoken words. If no speech, return empty string.",
-  "hook_phrase": "Exact words spoken in the first 5 seconds only",
-  "duration_seconds": 0,
-  "scene_count": 0,
-  "audio_energy": "high OR medium OR low",
-  "ocr_texts": [{"frame_index": 0, "text": "any on-screen text, captions, overlays you see"}],
-  "visual_analysis": {
-    "hookStrength": 8,
-    "pacing": "rapid-fire OR moderate OR slow-burn",
-    "editingStyle": "jump cuts / talking head / montage / b-roll / tutorial / etc",
-    "storyStructure": "Hook → Build → Payoff pattern description",
-    "emotionalTone": "primary emotion the video evokes",
-    "productionQuality": "high OR medium OR low",
-    "ctaVisual": "any call-to-action visible",
-    "attentionMechanisms": ["pattern interrupt", "curiosity gap", "etc"],
-    "frameDescriptions": [
-      {
-        "index": 0,
-        "timestamp": 0.5,
-        "description": "exact description of what is happening visually",
-        "cameraAngle": "close-up / wide / POV / overhead / etc",
-        "energyLevel": "high / medium / low",
-        "textOverlays": ["any text you see on screen"],
-        "facialExpression": "description or none"
-      }
-    ]
-  }
-}
-
-CRITICAL RULES:
-- Provide ONLY what you ACTUALLY see and hear — no guessing
-- Transcript must be verbatim spoken words
-- Include at least 6-10 frameDescriptions at different timestamps
-- Return ONLY the JSON, no markdown fences`;
-
+// ── URL helpers ────────────────────────────────────────────────────────────────
 function isYouTubeUrl(url: string): boolean {
   return url.includes("youtube.com") || url.includes("youtu.be");
 }
-
 function isInstagramUrl(url: string): boolean {
   return url.includes("instagram.com");
 }
 
-/** Use Gemini 2.5 Flash to natively watch and analyze a YouTube video. */
+// ── YouTube prompt — kept short to reduce Gemini latency ─────────────────────
+const YOUTUBE_PROMPT = `Watch this video carefully and return ONLY this JSON (no markdown fences):
+{
+  "transcript": "Complete verbatim transcript of all spoken words. Empty string if no speech.",
+  "hook_phrase": "Exact words spoken in first 5 seconds",
+  "duration_seconds": 0,
+  "scene_count": 0,
+  "audio_energy": "high|medium|low",
+  "ocr_texts": [{"frame_index": 0, "text": "on-screen text you see"}],
+  "visual_analysis": {
+    "hookStrength": 8,
+    "pacing": "rapid-fire|moderate|slow-burn",
+    "editingStyle": "jump cuts|talking head|montage|tutorial|etc",
+    "storyStructure": "Hook to Build to Payoff description",
+    "emotionalTone": "primary emotion",
+    "productionQuality": "high|medium|low",
+    "ctaVisual": "call-to-action text or none",
+    "attentionMechanisms": ["mechanism1", "mechanism2"],
+    "frameDescriptions": [
+      {"index": 0, "timestamp": 0.5, "description": "what you see", "cameraAngle": "close-up|wide|POV", "energyLevel": "high|medium|low", "textOverlays": [], "facialExpression": "description or none"}
+    ]
+  }
+}
+Rules: Only report what you actually see/hear. Include 6-10 frameDescriptions. Return JSON only.`;
+
+// ── Gemini native YouTube analysis ────────────────────────────────────────────
 async function analyzeYouTubeWithGemini(videoUrl: string) {
   const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
-  const model = genAI.getGenerativeModel({
-    model: "gemini-2.5-flash",
+
+  // Use Flash for speed — it can watch YouTube URLs natively
+  const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+
+  const result = await model.generateContent({
+    contents: [
+      {
+        role: "user",
+        parts: [
+          { fileData: { fileUri: videoUrl, mimeType: "video/*" } },
+          { text: YOUTUBE_PROMPT },
+        ],
+      },
+    ],
     generationConfig: {
-      responseMimeType: "application/json",
       maxOutputTokens: 8192,
+      temperature: 0.1, // Low temp = less hallucination, faster
     },
   });
 
-  const result = await model.generateContent([
-    { fileData: { fileUri: videoUrl, mimeType: "video/*" } },
-    { text: YOUTUBE_PROMPT },
-  ]);
-
   const text = result.response.text();
-  const clean = text
-    .replace(/^```json\s*/i, "")
-    .replace(/\s*```$/i, "")
-    .trim();
-  const parsed = JSON.parse(clean);
 
-  // Normalise visual_analysis into the same shape as /api/media/vision returns
-  const va = parsed.visual_analysis || {};
+  // Strip ALL markdown code fences — Gemini sometimes wraps with ```json\n...\n```
+  // Use a global replace to handle any variant (```json, ```, with/without newlines)
+  const clean = text
+    .replace(/^```[\w]*\r?\n?/im, "")  // strip opening fence ```json or ```
+    .replace(/\r?\n?```\s*$/im, "")    // strip closing fence ```
+    .trim();
+
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(clean);
+  } catch {
+    // If JSON parse fails, Gemini returned a refusal or error text
+    throw new Error(`Gemini returned non-JSON: ${text.slice(0, 100)}`);
+  }
+
+  const va = (parsed.visual_analysis || {}) as Record<string, unknown>;
   const frameDescriptions = Array.isArray(va.frameDescriptions)
     ? va.frameDescriptions
     : [];
 
+  // Detect empty/refusal response
+  const hasContent =
+    (parsed.transcript as string)?.length > 0 ||
+    frameDescriptions.length > 0 ||
+    (parsed.hook_phrase as string)?.length > 0;
+
+  if (!hasContent) {
+    throw new Error("Gemini returned empty analysis — video may be restricted or unavailable");
+  }
+
   return {
     fallback: false,
     source: "gemini-native",
-    frames: [],
-    transcript: parsed.transcript || "",
-    hook_phrase: parsed.hook_phrase || "",
+    frames: [] as unknown[],
+    transcript: (parsed.transcript as string) || "",
+    hook_phrase: (parsed.hook_phrase as string) || "",
     segments: [],
-    ocr_texts: Array.isArray(parsed.ocr_texts)
-      ? parsed.ocr_texts
-      : [],
+    ocr_texts: Array.isArray(parsed.ocr_texts) ? parsed.ocr_texts : [],
     duration_seconds: Number(parsed.duration_seconds) || 0,
     frame_count: frameDescriptions.length,
     scene_count: Number(parsed.scene_count) || 0,
-    audio_energy: parsed.audio_energy || "unknown",
-    // Embed visual analysis directly (skip separate /api/media/vision call)
+    audio_energy: (parsed.audio_energy as string) || "unknown",
     visual_analysis: {
       frameDescriptions,
       overall: {
-        hookStrength: va.hookStrength ?? 5,
-        pacing: va.pacing || "",
-        editingStyle: va.editingStyle || "",
-        ctaVisual: va.ctaVisual || "",
-        storyStructure: va.storyStructure || "",
-        productionQuality: va.productionQuality || "medium",
-        emotionalTone: va.emotionalTone || "",
-        attentionMechanisms: va.attentionMechanisms || [],
+        hookStrength: (va.hookStrength as number) ?? 5,
+        pacing: (va.pacing as string) || "",
+        editingStyle: (va.editingStyle as string) || "",
+        ctaVisual: (va.ctaVisual as string) || "",
+        storyStructure: (va.storyStructure as string) || "",
+        productionQuality: (va.productionQuality as string) || "medium",
+        emotionalTone: (va.emotionalTone as string) || "",
+        attentionMechanisms: (va.attentionMechanisms as string[]) || [],
       },
     },
   };
@@ -132,11 +140,9 @@ async function analyzeYouTubeWithGemini(videoUrl: string) {
  * POST /api/media/process
  *
  * Routing:
- *  - YouTube  → Gemini 2.5 Flash native URL analysis (no download, permanent fix)
- *  - Instagram/TikTok/direct MP4 → Railway Python media-service (yt-dlp + FFmpeg)
- *
- * On any failure returns { fallback: true, error: "..." } so the caller
- * can show targeted guidance instead of silent caption-only analysis.
+ *  1. YouTube  → Gemini 2.5 Flash native (watches video directly — no download)
+ *  2. Instagram → instagram_auth_required (needs browser extension with login)
+ *  3. TikTok / .mp4 → Python backend (yt-dlp + FFmpeg + Whisper + OCR)
  */
 export async function POST(req: NextRequest) {
   try {
@@ -153,96 +159,95 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // ── YouTube: Gemini watches the video natively — no Railway needed ────────
+    // ── 1. YouTube → Gemini 2.5 Flash native ─────────────────────────────────
     if (isYouTubeUrl(videoUrl)) {
+      console.log("[media/process] YouTube → Gemini 2.5 Flash native analysis");
       try {
-        console.log("[media/process] YouTube → Gemini native analysis");
         const data = await analyzeYouTubeWithGemini(videoUrl);
         console.log(
-          `[media/process] Gemini native OK — transcript:${data.transcript.length}chars scenes:${data.scene_count} dur:${data.duration_seconds}s`
+          `[media/process] Gemini OK — transcript:${data.transcript.length}chars ` +
+          `scenes:${data.scene_count} dur:${data.duration_seconds}s frames:${data.frame_count}`
         );
         return NextResponse.json(data);
       } catch (geminiErr) {
-        console.warn(
-          "[media/process] Gemini native failed, falling back to Railway:",
-          String(geminiErr).slice(0, 200)
-        );
-        // Fall through to Railway below
+        const errMsg = String(geminiErr);
+        console.warn("[media/process] Gemini failed:", errMsg.slice(0, 200));
+
+        // Fall through to Python backend as last resort for YouTube
+        console.log("[media/process] Trying Python backend for YouTube as fallback...");
+        try {
+          const serviceRes = await fetch(`${MEDIA_SERVICE_URL}/process`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ video_url: videoUrl, max_frames: maxFrames }),
+            signal: AbortSignal.timeout(90000),
+          });
+          if (serviceRes.ok) {
+            const data = await serviceRes.json();
+            return NextResponse.json({ ...data, fallback: false });
+          }
+        } catch { /* ignore */ }
+
+        // Both failed — return fallback with error
+        return NextResponse.json({
+          ...FALLBACK,
+          error: `youtube_processing_failed: ${errMsg.slice(0, 150)}`,
+        });
       }
     }
 
-    // ── Instagram without .mp4: surface clear error for extension guidance ─────
-    // Railway yt-dlp cannot download Instagram without login cookies.
-    // Return a specific error code the frontend can detect.
-    if (
-      isInstagramUrl(videoUrl) &&
-      !videoUrl.includes(".mp4") &&
-      !videoUrl.includes(".jpg")
-    ) {
-      console.log("[media/process] Instagram page URL → skip Railway, return auth_required");
-      return NextResponse.json({
-        ...FALLBACK,
-        error: "instagram_auth_required",
-      });
+    // ── 2. Instagram → needs browser extension ────────────────────────────────
+    if (isInstagramUrl(videoUrl) && !videoUrl.includes(".mp4")) {
+      console.log("[media/process] Instagram → auth_required");
+      return NextResponse.json({ ...FALLBACK, error: "instagram_auth_required" });
     }
 
-    // ── All other URLs: Railway Python service (yt-dlp + FFmpeg) ─────────────
+    // ── 3. TikTok / direct .mp4 → Python backend ──────────────────────────────
     let serviceRes: Response;
     try {
+      console.log(`[media/process] → Python backend: ${MEDIA_SERVICE_URL}/process`);
       serviceRes = await fetch(`${MEDIA_SERVICE_URL}/process`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          video_url: videoUrl,
-          max_frames: maxFrames,
-        }),
+        body: JSON.stringify({ video_url: videoUrl, max_frames: maxFrames }),
+        signal: AbortSignal.timeout(90000),
       });
     } catch (fetchErr) {
-      console.warn("[media/process] Railway unreachable:", fetchErr);
+      console.warn("[media/process] Python backend unreachable:", String(fetchErr).slice(0, 200));
       return NextResponse.json(
-        {
-          ...FALLBACK,
-          error: "media_service_unavailable",
-        },
+        { ...FALLBACK, error: "media_service_unavailable" },
         { status: 200 }
       );
     }
 
     if (!serviceRes.ok) {
-      const errText = await serviceRes.text().catch(() => "unknown error");
-      console.warn("[media/process] Railway error:", serviceRes.status, errText.slice(0, 200));
+      const errText = await serviceRes.text().catch(() => "unknown");
+      console.warn("[media/process] Backend error:", serviceRes.status, errText.slice(0, 200));
 
-      // Detect auth/access errors
-      const isTikTokBlock = errText.includes("IP address is blocked") || errText.includes("[TikTok]");
+      const isTikTokBlock =
+        errText.includes("IP address is blocked") || errText.includes("[TikTok]");
       const needsAuth =
         errText.toLowerCase().includes("login") ||
         errText.toLowerCase().includes("private") ||
-        errText.toLowerCase().includes("authentication") ||
-        errText.toLowerCase().includes("unauthorized");
+        errText.toLowerCase().includes("authentication");
 
-      return NextResponse.json(
-        {
-          ...FALLBACK,
-          error: isTikTokBlock
-            ? "tiktok_ip_blocked"
-            : needsAuth
-            ? "instagram_auth_required"
-            : `processing_failed: ${errText.slice(0, 150)}`,
-        },
-        { status: 200 }
-      );
+      return NextResponse.json({
+        ...FALLBACK,
+        error: isTikTokBlock
+          ? "tiktok_ip_blocked"
+          : needsAuth
+          ? "instagram_auth_required"
+          : `processing_failed: ${errText.slice(0, 150)}`,
+      });
     }
 
     const data = await serviceRes.json();
     console.log(
-      `[media/process] Railway OK — frames:${data.frame_count} scenes:${data.scene_count} dur:${data.duration_seconds}s`
+      `[media/process] Backend OK — frames:${data.frame_count} scenes:${data.scene_count} dur:${data.duration_seconds}s`
     );
     return NextResponse.json({ ...data, fallback: false });
   } catch (err) {
     console.error("[media/process] Unexpected error:", err);
-    return NextResponse.json(
-      { ...FALLBACK, error: String(err) },
-      { status: 200 }
-    );
+    return NextResponse.json({ ...FALLBACK, error: String(err) }, { status: 200 });
   }
 }

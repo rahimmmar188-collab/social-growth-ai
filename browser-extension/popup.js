@@ -31,13 +31,15 @@ let appUrl = DEFAULT_APP_URL;
 const PLATFORM_NAMES = {
   instagram: "Instagram",
   tiktok:    "TikTok",
+  youtube:   "YouTube",
   linkedin:  "LinkedIn",
   twitter:   "Twitter / X",
   facebook:  "Facebook",
+  threads:   "Threads",
   unknown:   "Unknown page",
 };
 
-const SUPPORTED = ["instagram", "tiktok", "linkedin", "twitter", "facebook"];
+const SUPPORTED = ["instagram", "tiktok", "youtube", "linkedin", "twitter", "facebook", "threads"];
 
 function setPlatformUI(platform, supported) {
   platformDot.className = "platform-dot " + (supported ? platform : "unsupported");
@@ -142,9 +144,11 @@ function detectPlatformFromUrl(url) {
   if (!url) return "unknown";
   if (url.includes("instagram.com")) return "instagram";
   if (url.includes("tiktok.com"))    return "tiktok";
+  if (url.includes("youtube.com") || url.includes("youtu.be")) return "youtube";
   if (url.includes("linkedin.com"))  return "linkedin";
   if (url.includes("twitter.com") || url.includes("x.com")) return "twitter";
   if (url.includes("facebook.com") || url.includes("fb.com")) return "facebook";
+  if (url.includes("threads.net"))   return "threads";
   return "unknown";
 }
 
