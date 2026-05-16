@@ -33,6 +33,7 @@ const steps = [
 ];
 
 const platforms = [
+  { name: "YouTube",   emoji: "▶️", border: "border-red-500/25",    bg: "bg-red-500/10",    text: "text-red-300"   },
   { name: "Instagram", emoji: "📸", border: "border-pink-500/25",   bg: "bg-pink-500/10",   text: "text-pink-300" },
   { name: "TikTok",    emoji: "🎵", border: "border-cyan-500/25",   bg: "bg-cyan-500/10",   text: "text-cyan-300" },
   { name: "LinkedIn",  emoji: "💼", border: "border-blue-500/25",   bg: "bg-blue-500/10",   text: "text-blue-300" },
