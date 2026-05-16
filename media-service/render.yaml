@@ -2,10 +2,14 @@ services:
   - type: web
     name: social-growth-media-service
     runtime: docker
-    plan: free
+    plan: starter
+    region: oregon
     healthCheckPath: /health
+    dockerfilePath: ./Dockerfile
     envVars:
       - key: PORT
         value: 8000
       - key: WHISPER_MODEL
         value: base.en
+      - key: PYTHONUNBUFFERED
+        value: "1"
