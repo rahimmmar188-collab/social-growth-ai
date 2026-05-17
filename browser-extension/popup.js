@@ -110,14 +110,21 @@ chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
       result = await tryExtract(tab.id);
     }
 
-    if (result && result.content && result.content.length > 10) {
+    if (result) {
       extractedData = { ...result, platform };
 
-      // Show what was captured
-      const hasVideo = !!result.videoUrl;
-      const captionLen = (result.caption || result.content || "").length;
-      showPreview(result.caption || result.content, captionLen, hasVideo);
-      sendBtn.disabled = false;
+      const hasContent  = (result.caption || result.content || "").length > 5;
+      const hasCdnVideo = !!result.isCdnVideoUrl;
+      const hasAnyVideo = !!result.videoUrl;
+
+      // Allow sending if we have caption OR a real CDN video URL
+      if (hasContent || hasCdnVideo) {
+        const captionLen = (result.caption || result.content || "").length;
+        showPreview(result.caption || result.content || "(Video post — caption unavailable)", captionLen, hasCdnVideo, hasAnyVideo, result.videoUrl);
+        sendBtn.disabled = false;
+      } else {
+        showWarning("No caption found. Try selecting the post text first, then click the extension.");
+      }
     } else {
       showWarning("No caption found. Try selecting the post text first, then click the extension.");
     }
@@ -153,12 +160,17 @@ function detectPlatformFromUrl(url) {
 }
 
 // ── Show preview ──────────────────────────────────────────────────────────────
-function showPreview(content, charCount, hasVideoUrl) {
-  previewText.textContent = content;
+function showPreview(content, charCount, hasCdnVideo, hasAnyVideo, videoUrl) {
+  previewText.textContent = content || "";
 
-  const videoTag = hasVideoUrl
-    ? " · 🎬 Video URL captured"
-    : " · ⚠ No direct video URL (captions only)";
+  let videoTag;
+  if (hasCdnVideo) {
+    videoTag = " · 🎬 CDN video captured — full AI analysis!";
+  } else if (hasAnyVideo) {
+    videoTag = " · 📄 Page URL only — caption + AI analysis";
+  } else {
+    videoTag = " · ⚠ No video URL — caption analysis only";
+  }
   previewChars.textContent = `${charCount} chars${videoTag}`;
   previewBox.style.display = "block";
   warningBox.style.display = "none";

@@ -109,7 +109,14 @@ export default function SpyRecreatePage() {
   useEffect(() => {
     if (didAutoImport.current) return;
     didAutoImport.current = true;
-    fetch("/api/extract?session=latest")
+
+    // Prefer the session ID passed in the URL (from popup.js), fallback to 'latest'
+    const urlSessionId = typeof window !== "undefined"
+      ? new URLSearchParams(window.location.search).get("session")
+      : null;
+    const sessionParam = urlSessionId || "latest";
+
+    fetch(`/api/extract?session=${encodeURIComponent(sessionParam)}`)
       .then((r) => r.json())
       .then((ext) => {
         if (ext.content && ext.content.length > 10) {

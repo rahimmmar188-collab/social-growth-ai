@@ -149,7 +149,6 @@ Based on ALL of the above multimodal signals, generate the complete viral intell
 // ── Multimodal system prompt ─────────────────────────────────────────────────
 function getMultimodalSystemPrompt(niche: string, platform: string, dataMode: string): string {
   const isFullMultimodal = dataMode === "full-multimodal";
-  const isTextOnly       = dataMode === "extension-text-only" || dataMode === "metadata-only";
 
   const dataSourceDescription = isFullMultimodal
     ? `You have received REAL, MACHINE-EXTRACTED data from physically watching, listening to, and reading a ${platform} video using:

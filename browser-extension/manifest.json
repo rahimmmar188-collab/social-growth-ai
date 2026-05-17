@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Social Growth AI — Smart Import",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "description": "Extract social media content and send directly to Social Growth AI for accurate AI-powered analysis. Supports YouTube, TikTok, Instagram, LinkedIn, Twitter/X, and Facebook.",
   "icons": {
     "16":  "icons/icon16.png",
