@@ -93,7 +93,7 @@ export default function SpyRecreatePage() {
   ];
   const [pipelineStage, setPipelineStage] = useState<PipelineStage>("idle");
   const [pipelineError, setPipelineError] = useState("");
-  const [instagramAuthRequired, setInstagramAuthRequired] = useState(false);
+  const [socialAuthRequired, setSocialAuthRequired] = useState<string | null>(null); // platform name needing auth
   const [mediaSignals, setMediaSignals] = useState<{
     transcript?: string; hookPhrase?: string; ocrTexts?: {frame_index:number;text:string}[];
     durationSeconds?: number; sceneCount?: number; audioEnergy?: string;
@@ -235,28 +235,62 @@ export default function SpyRecreatePage() {
     reset();
     setPipelineError("");
     setMediaSignals(null);
-    setInstagramAuthRequired(false);
+    setSocialAuthRequired(null);
 
     const platform = detectedPlatform || extensionPlatform || "Unknown";
     const caption   = extensionContent || pastedContent || (metadata as Record<string,string>|null)?.description || "";
-    const videoUrl  = extensionVideoUrl || url || "";
+
+    // ── Smart video URL selection ─────────────────────────────────────────────
+    // URL selection logic:
+    // Priority 1: CDN video URL from extension (cdninstagram, fbcdn, licdn.com, etc.) → ALWAYS process
+    // Priority 2: YouTube/TikTok page URL → Gemini native
+    // Priority 3: Direct .mp4 URL → Gemini inline or Python backend
+    // Priority 4: Social page URL (instagram.com, linkedin.com, facebook.com) → Python backend
+    // Skip video ONLY when: extension is active AND the video URL is another social page URL
+    //   (meaning extension gave us captions only, no CDN video URL)
+    const rawUrl = extensionVideoUrl || url || "";
+    const isGeminiNative = rawUrl.includes("youtube.com") || rawUrl.includes("youtu.be") || rawUrl.includes("tiktok.com");
+    const isDirectVideoFile = /\.(mp4|webm|mov|m4v)(\?|$)/i.test(rawUrl);
+    const isCdnVideo = (
+      rawUrl.includes("cdninstagram") || rawUrl.includes("fbcdn.net") ||
+      rawUrl.includes("scontent-") || rawUrl.includes("dms.licdn") ||
+      rawUrl.includes("video.licdn") || rawUrl.includes("akamaized.net")
+    );
+    // A social PAGE url (not CDN) — backend will try yt-dlp
+    const isSocialPageUrl = (
+      (rawUrl.includes("instagram.com") && !isCdnVideo) ||
+      (rawUrl.includes("linkedin.com") && !isCdnVideo) ||
+      (rawUrl.includes("facebook.com") && !isCdnVideo)
+    );
+    const canProcess = isGeminiNative || isDirectVideoFile || isCdnVideo || isSocialPageUrl;
+
+    // Skip video ONLY when extension provides caption but no processable video URL
+    const skipVideo = Boolean(extensionContent && !canProcess);
+    const videoUrlToProcess = skipVideo ? "" : rawUrl;
 
     let signals: typeof mediaSignals = null;
 
     // ── Step 1: Process video via media service ───────────────────────────────
-    if (videoUrl) {
+    if (videoUrlToProcess) {
       try {
         setPipelineStage("downloading");
         const pRes = await fetch("/api/media/process", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ videoUrl, maxFrames: 12 }),
+          body: JSON.stringify({ videoUrl: videoUrlToProcess, maxFrames: 12 }),
         });
         const pData = await pRes.json();
 
-        // Instagram requires login — surface extension guidance
-        if (pData.error === "instagram_auth_required") {
-          setInstagramAuthRequired(true);
+        const isAuthError = pData.error?.includes("auth_required") || pData.error?.includes("media_service_unavailable");
+        if (isAuthError) {
+          // Only show the auth banner if we don't already have extension content
+          if (!extensionContent) {
+            const platformName = pData.error?.includes("instagram") ? "Instagram"
+              : pData.error?.includes("linkedin") ? "LinkedIn"
+              : pData.error?.includes("facebook") ? "Facebook"
+              : "Social Media";
+            setSocialAuthRequired(platformName);
+          }
           signals = { fallback: true };
         } else if (!pData.fallback) {
           setPipelineStage("transcribing");
@@ -268,7 +302,7 @@ export default function SpyRecreatePage() {
           setPipelineStage("analyzing_vision");
 
           // Gemini-native responses already include visual_analysis embedded.
-          // Only call /api/media/vision for Railway responses (raw frames).
+          // Only call /api/media/vision for Python backend responses (raw frames).
           let visualAnalysis: Record<string,unknown> | null =
             pData.visual_analysis || null;
 
@@ -304,17 +338,24 @@ export default function SpyRecreatePage() {
         signals = { fallback: true };
       }
     } else {
+      // No video to process (extension text-only mode or no URL)
       signals = { fallback: true };
     }
 
     setMediaSignals(signals);
 
-    // ── Update confidence badge based on actual pipeline result ──────────────
-    if (signals && !signals.fallback) {
+    // ── Update confidence badge ────────────────────────────────────────────────
+    // HIGH when: real video was processed OR extension provided real content
+    if ((signals && !signals.fallback) || extensionContent) {
       setConfidence("HIGH");
     }
 
-    // ── Step 3: Final reasoning (streaming) ──────────────────────────────────
+    // ── Step 2: Final reasoning (streaming) ──────────────────────────────────
+    // When extension content is present, confidence is HIGH even in text-only mode
+    const effectiveConf = extensionContent ? "HIGH"
+      : (signals && !signals.fallback) ? "HIGH"
+      : "LOW";
+
     setPipelineStage("reasoning");
     await startStreaming("/api/agents/multimodal-url", {
       niche,
@@ -329,8 +370,10 @@ export default function SpyRecreatePage() {
       durationSeconds: signals?.durationSeconds || 0,
       sceneCount:      signals?.sceneCount || 0,
       audioEnergy:     signals?.audioEnergy || "unknown",
-      confidence:      signals?.fallback ? "LOW" : "HIGH",
+      confidence:      effectiveConf,
       userNote,
+      // Tell the AI what data sources are available
+      dataMode: skipVideo ? "extension-text-only" : signals?.fallback ? "metadata-only" : "full-multimodal",
     });
 
     setPipelineStage("done");
@@ -340,6 +383,7 @@ export default function SpyRecreatePage() {
     pastedContent, fallbackSubmitted, confidence, detectedPlatform,
     incrementUsage, startStreaming, reset,
   ]);
+
 
   // ── Effective confidence for display ─────────────────────────────────────────
   const effectiveConfidence: ContentConfidence = extensionContent
@@ -644,9 +688,9 @@ export default function SpyRecreatePage() {
         </div>
       </GlassCard>
 
-      {/* ── Instagram Auth Required Banner ── */}
+      {/* ── Social Auth Required Banner (Instagram / LinkedIn / Facebook) ── */}
       <AnimatePresence>
-        {instagramAuthRequired && (
+        {socialAuthRequired && (
           <motion.div
             initial={{ opacity: 0, y: 8 }}
             animate={{ opacity: 1, y: 0 }}
@@ -658,12 +702,12 @@ export default function SpyRecreatePage() {
                   <span className="text-xl">📲</span>
                 </div>
                 <div className="flex-1 space-y-2">
-                  <p className="text-sm font-semibold text-foreground">Instagram requires the browser extension</p>
+                  <p className="text-sm font-semibold text-foreground">{socialAuthRequired} requires the browser extension</p>
                   <p className="text-xs text-muted-foreground leading-relaxed">
-                    Instagram blocks direct video downloads from servers. To analyze Instagram Reels, open the post
-                    in your browser where you&apos;re already logged in, then click the{" "}
-                    <strong className="text-violet-400">Smart Import</strong> extension button — it runs in
-                    your authenticated session and extracts the real video + caption instantly.
+                    {socialAuthRequired} restricts direct video downloads. To get full multimodal analysis,
+                    open the post in your browser while logged in, then click the{" "}
+                    <strong className="text-violet-400">Smart Import</strong> extension — it extracts the real
+                    CDN video URL + caption from your authenticated session instantly.
                   </p>
                   <div className="flex items-center gap-2 pt-1">
                     <a
@@ -673,7 +717,7 @@ export default function SpyRecreatePage() {
                       <Download className="w-3 h-3" /> Get the Extension
                     </a>
                     <button
-                      onClick={() => { setInstagramAuthRequired(false); setShowFallback(true); }}
+                      onClick={() => { setSocialAuthRequired(null); setShowFallback(true); }}
                       className="text-xs text-muted-foreground hover:text-foreground transition-colors underline"
                     >
                       or paste the caption manually

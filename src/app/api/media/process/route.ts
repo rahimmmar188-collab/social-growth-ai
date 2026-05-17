@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
 export const runtime = "nodejs";
-export const maxDuration = 300; // 5 min — needed for Gemini video analysis
+export const maxDuration = 300;
 
 const MEDIA_SERVICE_URL =
   process.env.MEDIA_SERVICE_URL || "http://127.0.0.1:8000";
@@ -20,85 +20,74 @@ const FALLBACK = {
   audio_energy: "unknown",
 };
 
-// ── URL type helpers ──────────────────────────────────────────────────────────
-function isYouTubeUrl(url: string): boolean {
-  return url.includes("youtube.com") || url.includes("youtu.be");
+// ── URL type detection ────────────────────────────────────────────────────────
+function isYouTubeUrl(url: string)   { return url.includes("youtube.com") || url.includes("youtu.be"); }
+function isTikTokUrl(url: string)    { return url.includes("tiktok.com"); }
+function isInstagramUrl(url: string) { return url.includes("instagram.com") && !url.includes("cdninstagram"); }
+function isLinkedInUrl(url: string)  { return url.includes("linkedin.com") && !url.includes("licdn.com"); }
+function isFacebookUrl(url: string)  { return (url.includes("facebook.com") || url.includes("fb.com")) && !url.includes("fbcdn.net"); }
+
+/** CDN video URLs — publicly accessible without auth cookies */
+function isCdnVideoUrl(url: string): boolean {
+  return (
+    url.includes("cdninstagram.com") ||
+    url.includes("scontent-") ||          // Instagram CDN: scontent-sjc3-1.cdninstagram.com
+    url.includes("fbcdn.net") ||          // Facebook/Instagram CDN
+    url.includes("dms.licdn.com") ||      // LinkedIn video CDN
+    url.includes("video.licdn.com") ||    // LinkedIn video CDN alt
+    url.includes("akamaized.net") ||      // Generic CDN
+    url.includes("cloudfront.net") ||     // AWS CDN
+    (url.includes(".mp4") && url.startsWith("http")) ||
+    (url.includes(".webm") && url.startsWith("http")) ||
+    (url.includes(".mov") && url.startsWith("http"))
+  );
 }
-function isTikTokUrl(url: string): boolean {
-  return url.includes("tiktok.com");
-}
-function isInstagramUrl(url: string): boolean {
-  return url.includes("instagram.com");
-}
-function isDirectMp4(url: string): boolean {
-  return url.toLowerCase().includes(".mp4") && url.startsWith("http");
-}
-// URLs Gemini can watch natively (YouTube + any direct video link)
-function isGeminiNative(url: string): boolean {
+
+/** Check if Gemini can analyze this URL natively (no download needed) */
+function isGeminiNativeUrl(url: string): boolean {
   return isYouTubeUrl(url) || isTikTokUrl(url);
 }
 
-// ── Prompt for Gemini video analysis ─────────────────────────────────────────
-const VIDEO_ANALYSIS_PROMPT = `Watch this video carefully from start to finish. Return ONLY valid JSON (no markdown, no backticks, no explanation):
+// ── Video Analysis Prompt ─────────────────────────────────────────────────────
+const VIDEO_ANALYSIS_PROMPT = `Watch this entire video carefully. Return ONLY valid JSON — no markdown, no backticks, no explanation:
 {
-  "transcript": "Complete verbatim transcript of ALL spoken words, lyrics, or narration. If no speech, return empty string.",
-  "hook_phrase": "Exact words spoken or shown in first 3-5 seconds",
+  "transcript": "Complete verbatim transcript of ALL spoken words, lyrics, captions, or narration. If no speech at all, return empty string.",
+  "hook_phrase": "Exact words spoken or shown on screen in the first 3-5 seconds",
   "duration_seconds": 0,
   "scene_count": 0,
   "audio_energy": "high|medium|low",
-  "ocr_texts": [{"frame_index": 0, "text": "any text shown on screen"}],
+  "ocr_texts": [{"frame_index": 0, "text": "any text visible on screen at this timestamp"}],
   "visual_analysis": {
     "hookStrength": 8,
     "pacing": "rapid-fire|moderate|slow-burn",
-    "editingStyle": "jump cuts|talking head|montage|tutorial|b-roll|documentary",
-    "storyStructure": "Describe the Hook → Build → Payoff or problem → solution arc",
+    "editingStyle": "jump cuts|talking head|montage|tutorial|b-roll|vlog|product demo",
+    "storyStructure": "Describe the Hook → Build → Payoff arc in 1-2 sentences",
     "emotionalTone": "primary emotion of the content",
     "productionQuality": "high|medium|low",
-    "ctaVisual": "Any call-to-action text shown, or 'none'",
+    "ctaVisual": "Call-to-action text shown on screen, or none",
     "attentionMechanisms": ["list", "of", "techniques", "used"],
     "frameDescriptions": [
       {
         "index": 0,
         "timestamp": 0.5,
-        "description": "Detailed description of what is visible",
-        "cameraAngle": "close-up|wide|medium|POV|overhead",
+        "description": "Detailed scene description",
+        "cameraAngle": "close-up|wide|medium|POV|overhead|dutch",
         "energyLevel": "high|medium|low",
-        "textOverlays": ["any text shown on screen at this moment"],
-        "facialExpression": "description of person's expression, or 'no face visible'"
+        "textOverlays": ["any text on screen at this moment"],
+        "facialExpression": "description or none"
       }
     ]
   }
 }
-Important rules:
-- Report ONLY what you actually see and hear — never guess or hallucinate
+Rules:
+- Transcript MUST include all spoken words even if it is music/song lyrics
 - Include 6-10 frameDescriptions evenly spaced through the video
-- Transcript must include all spoken words, even if it is a song
-- Return pure JSON only — no backticks, no markdown`;
+- OCR: list every piece of text shown on screen across all frames
+- Never guess — only report what you actually see and hear
+- Return pure JSON only`;
 
-// ── Gemini video analysis (works for YouTube + TikTok URLs) ──────────────────
-async function analyzeWithGemini(videoUrl: string) {
-  const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
-  const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
-
-  const result = await model.generateContent({
-    contents: [
-      {
-        role: "user",
-        parts: [
-          { fileData: { fileUri: videoUrl, mimeType: "video/*" } },
-          { text: VIDEO_ANALYSIS_PROMPT },
-        ],
-      },
-    ],
-    generationConfig: {
-      maxOutputTokens: 8192,
-      temperature: 0.1,
-    },
-  });
-
-  const text = result.response.text();
-
-  // Strip markdown fences (Gemini sometimes wraps with ```json ... ```)
+// ── Parse Gemini response ─────────────────────────────────────────────────────
+function parseGeminiResponse(text: string) {
   const clean = text
     .replace(/^```[\w]*\r?\n?/im, "")
     .replace(/\r?\n?```\s*$/im, "")
@@ -108,15 +97,19 @@ async function analyzeWithGemini(videoUrl: string) {
   try {
     parsed = JSON.parse(clean);
   } catch {
-    throw new Error(`Gemini non-JSON response: ${text.slice(0, 120)}`);
+    // Try to extract JSON from middle of text
+    const jsonMatch = clean.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      try { parsed = JSON.parse(jsonMatch[0]); }
+      catch { throw new Error(`Gemini non-JSON: ${text.slice(0, 120)}`); }
+    } else {
+      throw new Error(`Gemini non-JSON: ${text.slice(0, 120)}`);
+    }
   }
 
   const va = (parsed.visual_analysis || {}) as Record<string, unknown>;
-  const frameDescriptions = Array.isArray(va.frameDescriptions)
-    ? va.frameDescriptions
-    : [];
+  const frameDescriptions = Array.isArray(va.frameDescriptions) ? va.frameDescriptions : [];
 
-  // Check for empty/refusal response
   const hasContent =
     (parsed.transcript as string)?.length > 0 ||
     frameDescriptions.length > 0 ||
@@ -130,32 +123,106 @@ async function analyzeWithGemini(videoUrl: string) {
     fallback: false,
     source: "gemini-native",
     frames: [] as unknown[],
-    transcript: (parsed.transcript as string) || "",
-    hook_phrase: (parsed.hook_phrase as string) || "",
-    segments: [],
-    ocr_texts: Array.isArray(parsed.ocr_texts) ? parsed.ocr_texts : [],
+    transcript:       (parsed.transcript as string)  || "",
+    hook_phrase:      (parsed.hook_phrase as string) || "",
+    segments:         [],
+    ocr_texts:        Array.isArray(parsed.ocr_texts) ? parsed.ocr_texts : [],
     duration_seconds: Number(parsed.duration_seconds) || 0,
-    frame_count: frameDescriptions.length,
-    scene_count: Number(parsed.scene_count) || 0,
-    audio_energy: (parsed.audio_energy as string) || "unknown",
+    frame_count:      frameDescriptions.length,
+    scene_count:      Number(parsed.scene_count) || 0,
+    audio_energy:     (parsed.audio_energy as string) || "unknown",
     visual_analysis: {
       frameDescriptions,
       overall: {
-        hookStrength: (va.hookStrength as number) ?? 5,
-        pacing: (va.pacing as string) || "",
-        editingStyle: (va.editingStyle as string) || "",
-        ctaVisual: (va.ctaVisual as string) || "",
-        storyStructure: (va.storyStructure as string) || "",
-        productionQuality: (va.productionQuality as string) || "medium",
-        emotionalTone: (va.emotionalTone as string) || "",
+        hookStrength:        (va.hookStrength as number)     ?? 5,
+        pacing:              (va.pacing as string)           || "",
+        editingStyle:        (va.editingStyle as string)     || "",
+        ctaVisual:           (va.ctaVisual as string)        || "",
+        storyStructure:      (va.storyStructure as string)   || "",
+        productionQuality:   (va.productionQuality as string)|| "medium",
+        emotionalTone:       (va.emotionalTone as string)    || "",
         attentionMechanisms: (va.attentionMechanisms as string[]) || [],
       },
     },
   };
 }
 
-// ── Fetch from Python backend ─────────────────────────────────────────────────
-async function fetchFromPythonBackend(videoUrl: string, maxFrames: number) {
+// ── Strategy 1: Gemini Native (YouTube/TikTok URL passed directly) ─────────────
+async function analyzeWithGeminiNative(videoUrl: string) {
+  const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
+  const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+
+  const result = await model.generateContent({
+    contents: [{
+      role: "user",
+      parts: [
+        { fileData: { fileUri: videoUrl, mimeType: "video/*" } },
+        { text: VIDEO_ANALYSIS_PROMPT },
+      ],
+    }],
+    generationConfig: { maxOutputTokens: 8192, temperature: 0.1 },
+  });
+
+  return parseGeminiResponse(result.response.text());
+}
+
+// ── Strategy 2: Download CDN video → send as inline base64 to Gemini ──────────
+const MAX_CDN_VIDEO_MB = 45; // Gemini inline data limit for free tier is ~20MB, paid is higher
+const BROWSER_HEADERS = {
+  "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+  "Accept": "video/mp4,video/*;q=0.9,*/*;q=0.8",
+  "Accept-Language": "en-US,en;q=0.9",
+  "Referer": "https://www.instagram.com/",
+};
+
+async function analyzeWithGeminiInline(videoUrl: string, referer?: string) {
+  const headers: Record<string, string> = {
+    ...BROWSER_HEADERS,
+    ...(referer ? { "Referer": referer } : {}),
+  };
+
+  // Download video
+  const dlRes = await fetch(videoUrl, {
+    headers,
+    signal: AbortSignal.timeout(60000),
+  });
+
+  if (!dlRes.ok) {
+    throw new Error(`CDN download failed: HTTP ${dlRes.status}`);
+  }
+
+  const contentType = dlRes.headers.get("content-type") || "video/mp4";
+  const contentLength = Number(dlRes.headers.get("content-length") || "0");
+
+  if (contentLength > MAX_CDN_VIDEO_MB * 1024 * 1024) {
+    throw new Error(`Video too large for inline analysis (${Math.round(contentLength / 1024 / 1024)}MB > ${MAX_CDN_VIDEO_MB}MB)`);
+  }
+
+  const videoBytes = await dlRes.arrayBuffer();
+  const base64Video = Buffer.from(videoBytes).toString("base64");
+  const mimeType = contentType.split(";")[0].trim() || "video/mp4";
+
+  console.log(`[media/process] CDN download OK — ${Math.round(videoBytes.byteLength / 1024)}KB, type=${mimeType}`);
+
+  const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
+  const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+
+  const result = await model.generateContent({
+    contents: [{
+      role: "user",
+      parts: [
+        { inlineData: { data: base64Video, mimeType } },
+        { text: VIDEO_ANALYSIS_PROMPT },
+      ],
+    }],
+    generationConfig: { maxOutputTokens: 8192, temperature: 0.1 },
+  });
+
+  return parseGeminiResponse(result.response.text());
+}
+
+// ── Strategy 3: Python backend (yt-dlp + Whisper + OCR) ──────────────────────
+async function analyzeWithPythonBackend(videoUrl: string, maxFrames: number) {
   const serviceRes = await fetch(`${MEDIA_SERVICE_URL}/process`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -169,25 +236,24 @@ async function fetchFromPythonBackend(videoUrl: string, maxFrames: number) {
     const needsAuth = errText.toLowerCase().includes("login") ||
       errText.toLowerCase().includes("private") ||
       errText.toLowerCase().includes("authentication");
-    const errCode = isTikTokBlock ? "tiktok_ip_blocked"
-      : needsAuth ? "instagram_auth_required"
-      : `processing_failed: ${errText.slice(0, 150)}`;
-    throw new Error(errCode);
+    throw new Error(
+      isTikTokBlock ? "tiktok_ip_blocked"
+      : needsAuth   ? "social_auth_required"
+      : `backend_error: ${errText.slice(0, 150)}`
+    );
   }
 
-  const data = await serviceRes.json();
-  return { ...data, fallback: false };
+  return { ...(await serviceRes.json()), fallback: false };
 }
 
 /**
  * POST /api/media/process
  *
- * Routing strategy:
- *  1. YouTube  → Gemini 2.5 Flash native (always, no download needed)
- *  2. TikTok   → Gemini 2.5 Flash native first, fallback to Python backend
- *  3. Instagram → instagram_auth_required (needs browser extension)
- *  4. Direct .mp4 → Python backend (download + Whisper + OCR)
- *  5. Everything else → Python backend
+ * Routing:
+ *  1. YouTube / TikTok → Gemini native (no download)
+ *  2. CDN video URL (cdninstagram, fbcdn, licdn, .mp4, etc.) → download + Gemini inline
+ *  3. Instagram/LinkedIn/Facebook page URL → Python backend (yt-dlp)
+ *  4. Fallback on any failure
  */
 export async function POST(req: NextRequest) {
   try {
@@ -198,65 +264,80 @@ export async function POST(req: NextRequest) {
     };
 
     if (!videoUrl || typeof videoUrl !== "string") {
-      return NextResponse.json(
-        { error: "videoUrl is required", ...FALLBACK },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: "videoUrl is required", ...FALLBACK }, { status: 400 });
     }
 
-    // ── 1 & 2: YouTube + TikTok → Gemini native ──────────────────────────────
-    if (isGeminiNative(videoUrl)) {
-      const platform = isYouTubeUrl(videoUrl) ? "YouTube" : "TikTok";
-      console.log(`[media/process] ${platform} → Gemini 2.5 Flash native`);
+    const url = videoUrl.trim();
+    console.log(`[media/process] URL: ${url.slice(0, 80)}`);
+
+    // ── 1. YouTube / TikTok → Gemini Native ─────────────────────────────────
+    if (isGeminiNativeUrl(url)) {
+      const platform = isYouTubeUrl(url) ? "YouTube" : "TikTok";
+      console.log(`[media/process] ${platform} → Gemini native`);
       try {
-        const data = await analyzeWithGemini(videoUrl);
-        console.log(
-          `[media/process] Gemini OK — transcript:${data.transcript.length}ch ` +
-          `scenes:${data.scene_count} dur:${data.duration_seconds}s frames:${data.frame_count}`
-        );
+        const data = await analyzeWithGeminiNative(url);
+        console.log(`[media/process] ${platform} Gemini OK — transcript:${data.transcript.length}ch frames:${data.frame_count}`);
         return NextResponse.json(data);
-      } catch (geminiErr) {
-        const errMsg = String(geminiErr);
-        console.warn(`[media/process] Gemini failed for ${platform}:`, errMsg.slice(0, 200));
-
-        // Fallback to Python backend if available
+      } catch (err) {
+        console.warn(`[media/process] ${platform} Gemini failed:`, String(err).slice(0, 150));
+        // Fallback to Python backend
         try {
-          console.log("[media/process] Falling back to Python backend...");
-          const data = await fetchFromPythonBackend(videoUrl, maxFrames);
-          return NextResponse.json(data);
-        } catch (backendErr) {
-          console.warn("[media/process] Python backend also failed:", String(backendErr).slice(0, 100));
-        }
-
-        return NextResponse.json({
-          ...FALLBACK,
-          error: `${platform.toLowerCase()}_processing_failed: ${errMsg.slice(0, 150)}`,
-        });
+          return NextResponse.json(await analyzeWithPythonBackend(url, maxFrames));
+        } catch { /* ignore backend errors */ }
+        return NextResponse.json({ ...FALLBACK, error: `${platform.toLowerCase()}_analysis_failed: ${String(err).slice(0, 100)}` });
       }
     }
 
-    // ── 3. Instagram without direct .mp4 → needs extension ───────────────────
-    if (isInstagramUrl(videoUrl) && !isDirectMp4(videoUrl)) {
-      console.log("[media/process] Instagram → instagram_auth_required");
-      return NextResponse.json({ ...FALLBACK, error: "instagram_auth_required" });
+    // ── 2. CDN video URL → Download + Gemini Inline ──────────────────────────
+    if (isCdnVideoUrl(url)) {
+      console.log("[media/process] CDN video URL → Gemini inline analysis");
+      const referer = url.includes("cdninstagram") || url.includes("scontent-") || url.includes("fbcdn.net")
+        ? "https://www.instagram.com/"
+        : url.includes("licdn.com")
+        ? "https://www.linkedin.com/"
+        : undefined;
+      try {
+        const data = await analyzeWithGeminiInline(url, referer);
+        console.log(`[media/process] CDN Gemini OK — transcript:${data.transcript.length}ch frames:${data.frame_count}`);
+        return NextResponse.json(data);
+      } catch (err) {
+        console.warn("[media/process] CDN Gemini inline failed:", String(err).slice(0, 150));
+        // Fallback to Python backend
+        try {
+          return NextResponse.json(await analyzeWithPythonBackend(url, maxFrames));
+        } catch { /* ignore */ }
+        return NextResponse.json({ ...FALLBACK, error: `cdn_analysis_failed: ${String(err).slice(0, 100)}` });
+      }
     }
 
-    // ── 4 & 5: Direct .mp4 / other → Python backend ───────────────────────────
-    try {
-      console.log(`[media/process] → Python backend: ${MEDIA_SERVICE_URL}/process`);
-      const data = await fetchFromPythonBackend(videoUrl, maxFrames);
-      console.log(
-        `[media/process] Backend OK — frames:${data.frame_count} scenes:${data.scene_count} dur:${data.duration_seconds}s`
-      );
-      return NextResponse.json(data);
-    } catch (err) {
-      const errMsg = String(err);
-      console.warn("[media/process] Backend failed:", errMsg.slice(0, 200));
-      return NextResponse.json(
-        { ...FALLBACK, error: errMsg.includes("fetch") ? "media_service_unavailable" : errMsg },
-        { status: 200 }
-      );
+    // ── 3. Instagram / LinkedIn / Facebook page URL → Python backend ─────────
+    if (isInstagramUrl(url) || isLinkedInUrl(url) || isFacebookUrl(url)) {
+      const platform = isInstagramUrl(url) ? "Instagram" : isLinkedInUrl(url) ? "LinkedIn" : "Facebook";
+      console.log(`[media/process] ${platform} page URL → Python backend`);
+      try {
+        const data = await analyzeWithPythonBackend(url, maxFrames);
+        console.log(`[media/process] ${platform} backend OK — frames:${data.frame_count}`);
+        return NextResponse.json(data);
+      } catch (err) {
+        const errMsg = String(err);
+        console.warn(`[media/process] ${platform} backend failed:`, errMsg.slice(0, 150));
+        // Return platform-specific error code
+        const errorCode = errMsg.includes("auth_required") || errMsg.includes("login")
+          ? `${platform.toLowerCase()}_auth_required`
+          : "media_service_unavailable";
+        return NextResponse.json({ ...FALLBACK, error: errorCode });
+      }
     }
+
+    // ── 4. Everything else → Python backend ──────────────────────────────────
+    console.log(`[media/process] Generic URL → Python backend`);
+    try {
+      return NextResponse.json(await analyzeWithPythonBackend(url, maxFrames));
+    } catch (err) {
+      console.warn("[media/process] Backend failed:", String(err).slice(0, 150));
+      return NextResponse.json({ ...FALLBACK, error: "media_service_unavailable" });
+    }
+
   } catch (err) {
     console.error("[media/process] Unexpected error:", err);
     return NextResponse.json({ ...FALLBACK, error: String(err) }, { status: 200 });

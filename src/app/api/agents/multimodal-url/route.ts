@@ -31,6 +31,7 @@ export async function POST(req: NextRequest) {
       audioEnergy,
       confidence,
       userNote,
+      dataMode,
     } = await req.json();
 
     // ── Build the grounded user message ────────────────────────────────────
@@ -81,7 +82,7 @@ ${overallVision}
 Based on ALL of the above multimodal signals, generate the complete viral intelligence analysis.
 `.trim();
 
-    const systemPrompt = getMultimodalSystemPrompt(niche || "general", platform || "unknown");
+    const systemPrompt = getMultimodalSystemPrompt(niche || "general", platform || "unknown", dataMode || "full-multimodal");
 
     // ── Stream response ────────────────────────────────────────────────────
     const encoder = new TextEncoder();
@@ -146,16 +147,27 @@ Based on ALL of the above multimodal signals, generate the complete viral intell
 }
 
 // ── Multimodal system prompt ─────────────────────────────────────────────────
-function getMultimodalSystemPrompt(niche: string, platform: string): string {
+function getMultimodalSystemPrompt(niche: string, platform: string, dataMode: string): string {
+  const isFullMultimodal = dataMode === "full-multimodal";
+  const isTextOnly       = dataMode === "extension-text-only" || dataMode === "metadata-only";
+
+  const dataSourceDescription = isFullMultimodal
+    ? `You have received REAL, MACHINE-EXTRACTED data from physically watching, listening to, and reading a ${platform} video using:
+- Gemini Vision multimodal analysis (actual video frames)
+- Audio transcription (actual spoken words)
+- OCR (actual on-screen text)
+- Caption/post text
+
+This is NOT speculation. Ground ALL your analysis in the provided data.`
+    : `You have received the CAPTION / POST TEXT from a ${platform} post extracted directly by the user's browser extension.
+You do NOT have video frame data, audio transcription, or OCR for this post — the video could not be analyzed directly.
+
+Be honest about what data is and isn't available. For visual/audio fields where you have no data, say "not available — based on caption analysis only".
+Do NOT fabricate video timestamps, frame descriptions, or spoken quotes that aren't in the provided text.`;
+
   return `You are an elite Multimodal Viral Intelligence Analyst.
 
-You have received REAL, MACHINE-EXTRACTED data from physically watching, listening to, and reading a ${platform} reel using:
-- FFmpeg keyframe extraction (actual video frames)
-- faster-whisper audio transcription (actual spoken words)
-- pytesseract OCR (actual on-screen text)
-- Gemini vision analysis (actual visual understanding)
-
-This is NOT speculation. Ground ALL your analysis in the provided data.
+${dataSourceDescription}
 
 STRICT RULES:
 1. Quote actual phrases from the transcript when relevant
